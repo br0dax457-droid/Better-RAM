@@ -1,5 +1,5 @@
 """
-AltManager v16 - Windows only.
+AltManager v17 - Windows only.
     pip install customtkinter requests psutil playwright
     python Better_RAM.py   (relaunches itself without a console window; add --console to keep it)
 
@@ -20,7 +20,7 @@ if os.name == "nt" and os.path.basename(sys.executable).lower() == "python.exe" 
 try: ctypes.windll.shcore.SetProcessDpiAwareness(2)   # real pixels, not scaled (must run before any window exists)
 except Exception: pass
 
-VERSION = 15                       # bump this in the file you publish; running copies update when it is higher
+VERSION = 17                       # bump this in the file you publish; running copies update when it is higher
 UPDATE_URL = "https://raw.githubusercontent.com/br0dax457-droid/Better-RAM/main/Better_RAM.py"   # built-in update link
 
 # ======================= dependencies: install what's missing, re-check weekly =======================
@@ -101,7 +101,7 @@ DEFAULTS = {"accounts": [], "games": [], "place": "", "job": "", "delay": 6,
             "trim": True, "trim_sec": 90, "lowprio": True,
             "afk": False, "afk_min": 8, "afk_off": 8, "afk_gap": 1200,
             "watch": True, "watch_sec": 60, "auto_rejoin": False, "afk_skip": [], "idle_prio": [], "view_order": [],
-            "update_url": "", "auto_update": True}
+            "update_url": "", "auto_update": True, "hotkeys": True}
 STR_KEYS = {"place", "job", "update_url"}
 
 # ======================= cookies (Windows DPAPI) =======================
@@ -171,6 +171,11 @@ def put(r, key, text, color=None):
     if r.get(key + "_v") == (text, color): return
     r[key + "_v"] = (text, color)
     r[key].configure(text=text, **({"text_color": color} if color else {}))
+
+def desktop():
+    buf = ctypes.create_unicode_buffer(260)
+    if ctypes.windll.shell32.SHGetFolderPathW(0, 0x10, 0, 0, buf) == 0 and buf.value: return buf.value   # follows OneDrive redirects
+    return os.path.join(os.path.expanduser("~"), "Desktop")
 
 def find_browser():
     for rel in (r"Microsoft\Edge\Application\msedge.exe", r"Google\Chrome\Application\chrome.exe"):
@@ -361,7 +366,7 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         global BORDER, RADIUS
-        sc = getattr(self, "_get_window_scaling", lambda: 1.0)()          # display scale (1.0 / 1.25 / 1.5 ...)
+        sc = getattr(self, "_get_window_scaling", lambda: 1.0)(); self.scale = sc          # display scale (1.0 / 1.25 / 1.5 ...)
         BORDER, RADIUS = max(2, round(2 * sc)), round(10 * sc)             # tile border follows the scale
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()       # real pixels (DPI-aware process)
         w = int(min(0.9 * sw / sc, max(920, 0.6 * sw / sc))); h = int(min(0.9 * sh / sc, max(880, 0.8 * sh / sc)))
@@ -380,6 +385,9 @@ class App(ctk.CTk):
         self.started, self.launch_info = {}, {}             # launch time / (place, job) per account
         # viewer state
         self.cells, self.badges, self.fixes, self.drag = {}, {}, {}, None
+        self.ph = self.ph_name = None                       # "Focused" placeholder tile
+        self.afk_narrow, self.afk_sel = None, {}
+        self.hk_thread, self.hk_tid = None, 0
         self.active = self.maxed = None
         self.dock_local = self.last_dock = self._relayout = None
         self.press, self.was_down, self.app_fg_top, self._tab = None, False, False, ""
@@ -396,6 +404,7 @@ class App(ctk.CTk):
         for fn in (self.maintenance, self.watch_loop):
             threading.Thread(target=fn, daemon=True).start()
         if self.cfg["auto_update"]: self.after(4000, lambda: threading.Thread(target=self.check_update, daemon=True).start())
+        if self.cfg["hotkeys"]: self.hotkeys(True)
         self.log("AltManager started")
 
     @property
@@ -422,15 +431,17 @@ class App(ctk.CTk):
         ctk.CTkEntry(f, textvariable=v, width=w, height=34, corner_radius=10, fg_color=FIELD,
                      border_width=0).pack(side="left", padx=(8, 22))
 
-    def check(self, f, label, key):
+    def check(self, f, label, key, cmd=None):
         v = tk.BooleanVar(value=self.cfg[key]); self.v[key] = v
-        ctk.CTkCheckBox(f, text=label, variable=v, onvalue=True, offvalue=False, corner_radius=7,
+        ctk.CTkCheckBox(f, text=label, variable=v, onvalue=True, offvalue=False, corner_radius=7, command=cmd,
                         fg_color=TXT, hover_color="#ffffff", checkmark_color=BG, border_color=BTN_H,
                         text_color=TXT).pack(side="left", padx=(0, 24))
 
-    def confirm(self, title, text, buttons):
+    def confirm(self, title, text, buttons, field=None, secret=False, body=None):
         """In-app prompt drawn over the whole window. Docked game windows are hidden meanwhile so nothing can cover it.
-        buttons = [(label, value), ...]; the first one is the primary action. Returns the clicked value."""
+        buttons = [(label, value), ...]; the first is the primary action, the last one also answers Escape.
+        field = initial text adds an entry (the primary button then returns its text, the others None);
+        body(card) may add more widgets. Returns the clicked value."""
         if self.modal: return None
         self.modal = True
         hidden = [h for h in DOCKED if user32.IsWindow(h)]
@@ -439,12 +450,21 @@ class App(ctk.CTk):
         card = ctk.CTkFrame(ov, fg_color=CARD, corner_radius=18); card.place(relx=0.5, rely=0.4, anchor="center")
         ctk.CTkLabel(card, text=title, font=("Segoe UI Semibold", 17), text_color=TXT).pack(padx=34, pady=(26, 6))
         ctk.CTkLabel(card, text=text, justify="left", text_color=MUTED, wraplength=420).pack(padx=34, pady=(0, 18))
+        if body: body(card)
+        e = None
+        if field is not None:
+            e = ctk.CTkEntry(card, width=400, height=38, corner_radius=10, fg_color=FIELD, border_width=0, show="•" if secret else "")
+            e.insert(0, field); e.pack(padx=34, pady=(0, 18))
         out = tk.StringVar(); res = {}
-        def pick(i): res["v"] = buttons[i][1]; out.set("x")
+        def pick(i):
+            res["v"] = e.get() if e is not None and i == 0 else buttons[i][1]; out.set("x")
         row = ctk.CTkFrame(card, fg_color="transparent"); row.pack(pady=(0, 26))
         for i, (label, _) in enumerate(buttons):
             self.btn(row, label, lambda i=i: pick(i), primary=(i == 0), w=130).pack(side="left", padx=6)
-        ov.bind("<Escape>", lambda _: pick(len(buttons) - 1)); ov.focus_set()
+        for w in (ov, e):
+            if w is not None: w.bind("<Escape>", lambda _: pick(len(buttons) - 1))
+        if e is not None: e.bind("<Return>", lambda _: pick(0)); e.focus_set()
+        else: ov.focus_set()
         self.wait_variable(out)
         ov.destroy(); self.modal = False
         for h in hidden:
@@ -452,19 +472,11 @@ class App(ctk.CTk):
         self.after(50, self.retile); self.after(150, self.verify_layout)
         return res["v"]
 
-    def ask(self, title, prompt, secret=False):
-        d = ctk.CTkToplevel(self); d.title(title); d.geometry("480x210"); d.configure(fg_color=CARD)
-        d.transient(self); d.after(150, d.grab_set)
-        out = {"v": None}
-        ctk.CTkLabel(d, text=prompt, justify="left", text_color=TXT).pack(anchor="w", padx=22, pady=(22, 8))
-        e = ctk.CTkEntry(d, width=436, height=38, corner_radius=10, fg_color=FIELD, border_width=0,
-                         show="•" if secret else ""); e.pack(padx=22); e.focus()
-        def ok(*_): out["v"] = e.get(); d.destroy()
-        row = ctk.CTkFrame(d, fg_color="transparent"); row.pack(pady=20)
-        self.btn(row, "Cancel", d.destroy, w=110).pack(side="left", padx=8)
-        self.btn(row, "OK", ok, primary=True, w=110).pack(side="left", padx=8)
-        d.bind("<Return>", ok); self.wait_window(d)
-        return out["v"]
+    def note(self, title, text): self.confirm(title, text, [("OK", True)])
+
+    def ask(self, title, prompt, secret=False, default=""):
+        """Text entry; returns the text ("" is allowed) or None when cancelled."""
+        return self.confirm(title, prompt, [("OK", True), ("Cancel", None)], field=default, secret=secret)
 
     # ---------- UI ----------
     def build(self):
@@ -491,7 +503,8 @@ class App(ctk.CTk):
         top = ctk.CTkFrame(af, fg_color="transparent"); top.pack(fill="x")
         ctk.CTkLabel(top, text="AFK on:", text_color=MUTED).pack(side="left", padx=(0, 8))
         self.btn(top, "All", lambda: self.afk_all(True), w=50, h=26).pack(side="left", padx=(0, 6))
-        self.btn(top, "None", lambda: self.afk_all(False), w=56, h=26).pack(side="left")
+        self.btn(top, "None", lambda: self.afk_all(False), w=56, h=26).pack(side="left", padx=(0, 6))
+        self.afk_btn = self.btn(top, "List", self.afk_picker, w=96, h=26); self.afk_btn.pack(side="left")
         self.afk_list = ctk.CTkScrollableFrame(af, orientation="horizontal", height=36, fg_color=FIELD, corner_radius=10)
         self.afk_list.pack(fill="x", pady=(4, 0))
         self.stage = tk.Frame(view, bg="#000000", highlightthickness=0)
@@ -540,7 +553,8 @@ class App(ctk.CTk):
                       fg_color=TXT, hover_color="#ffffff", text_color=BG,
                       font=("Segoe UI Semibold", 17)).grid(row=0, column=0, rowspan=3, padx=6, pady=4, sticky="ns")
         cols = ([("Rejoin selected", self.rejoin_selected), ("Close selected", self.close_selected), ("Close all", self.close_all)],
-                [("Add (paste cookie)", self.add), ("Add via browser", self.add_browser), ("Remove selected", self.remove)])
+                [("Add (paste cookie)", self.add), ("Add via browser", self.add_browser), ("Remove selected", self.remove)],
+                [("Export accounts", self.export_accounts), ("Import accounts", self.import_accounts)])
         for c, items in enumerate(cols, 1):
             for r, (text, cmd) in enumerate(items): self.btn(bar, text, cmd, w=150).grid(row=r, column=c, padx=6, pady=4)
 
@@ -577,6 +591,12 @@ class App(ctk.CTk):
         ctk.CTkLabel(c, wraplength=700, justify="left", text_color=MUTED,
                      text="Asks Roblox whether each account is still in a game. A disconnect is flagged after 2 checks in a "
                           "row, so expect 1-2+ minutes. If an account uses 'appear offline', turn it off in the Viewer tab.").pack(anchor="w", padx=18, pady=(0, 14))
+        c = self.card(sc, "Hotkeys")
+        f = self.line(c); self.check(f, "Hotkeys", "hotkeys", lambda: self.hotkeys(self.v["hotkeys"].get()))
+        ctk.CTkLabel(c, wraplength=700, justify="left", text_color=MUTED,
+                     text="Ctrl+Shift+1..9 focus the 1st..9th running account (tile order), Ctrl+Shift+Left / Right = previous / next. "
+                          "Works while a game window has focus. If another program already uses a key, it is listed in the Log tab."
+                     ).pack(anchor="w", padx=18, pady=(0, 14))
         c = self.card(sc, f"Updates  (installed: v{VERSION})")
         f = self.line(c); self.entry(f, "Update link (https)", "update_url", 430)
         f = self.line(c); self.check(f, "Check at launch", "auto_update"); self.btn(f, "Check now", self.check_update_now, w=120).pack(side="left")
@@ -641,7 +661,7 @@ class App(ctk.CTk):
 
     def save_game(self):
         self.collect(); pid = parse_place(self.cfg["place"])
-        if not pid: return messagebox.showwarning("Game", "Paste a game ID or link first.")
+        if not pid: return self.note("Game", "Paste a game ID or link first.")
         name = self.ask("Save game", "Name for this game:")
         if not name: return
         self.cfg["games"] = [g for g in self.cfg["games"] if g["place"] != pid] + [{"name": name, "place": pid}]
@@ -681,8 +701,11 @@ class App(ctk.CTk):
                             hover_color="#ffffff", checkmark_color=BG, border_color=BTN_H, text_color=MUTED,
                             font=("Segoe UI", 12)).grid(row=0, column=4, padx=(8, 4))
             self.btn(f, "Show", lambda n=n: self.show(n), w=60).grid(row=0, column=5, padx=(8, 4))
-            self.btn(f, "Max", lambda n=n: self.max_instance(n), w=56).grid(row=0, column=6, padx=(0, 12))
-            self.rows[n] = {"st": st, "cpu": cpu, "ram": ram}
+            self.btn(f, "Max", lambda n=n: self.max_instance(n), w=56).grid(row=0, column=6, padx=(0, 4))
+            pw = self.btn(f, "Password", lambda n=n: self.set_password(n), w=84)
+            if self.account(n).get("password"): pw.configure(text_color=GREEN)       # green = a password is stored
+            pw.grid(row=0, column=7, padx=(0, 12))
+            self.rows[n] = {"st": st, "cpu": cpu, "ram": ram, "pw": pw}
         self.build_afk_list(names); self.after(50, self.update_rows)
 
     def set_status(self, name, text, color=MUTED):
@@ -691,15 +714,17 @@ class App(ctk.CTk):
             if r: put(r, "st", text, color)
         self.after(0, go)
 
+    def afk_box(self, parent, n):
+        return ctk.CTkCheckBox(parent, text=n, variable=self.afk_sel[n], command=self.afk_toggle, width=20,
+                               checkbox_width=18, checkbox_height=18, corner_radius=5, fg_color=TXT, hover_color="#ffffff",
+                               checkmark_color=BG, border_color=BTN_H, text_color=TXT, font=("Segoe UI", 12))
+
     def build_afk_list(self, names):
         for w in self.afk_list.winfo_children(): w.destroy()
         skip = set(self.cfg["afk_skip"])
-        self.afk_sel = {n: tk.BooleanVar(value=n not in skip) for n in names}
-        for n in names:
-            ctk.CTkCheckBox(self.afk_list, text=n, variable=self.afk_sel[n], command=self.afk_toggle, width=20,
-                            checkbox_width=18, checkbox_height=18, corner_radius=5, fg_color=TXT, hover_color="#ffffff",
-                            checkmark_color=BG, border_color=BTN_H, text_color=TXT,
-                            font=("Segoe UI", 12)).pack(side="left", padx=(6, 4))
+        self.afk_sel = {n: tk.BooleanVar(value=n not in skip) for n in names}     # the one source of truth
+        for n in names: self.afk_box(self.afk_list, n).pack(side="left", padx=(6, 4))
+        self.afk_count()
 
     def afk_all(self, on):
         for v in self.afk_sel.values(): v.set(on)
@@ -707,17 +732,41 @@ class App(ctk.CTk):
 
     def afk_toggle(self):
         self.cfg["afk_skip"] = [n for n, v in self.afk_sel.items() if not v.get()]
+        self.afk_count()
+
+    def afk_count(self):
+        t = f"List ({sum(v.get() for v in self.afk_sel.values())}/{len(self.afk_sel)})"
+        if self.afk_btn.cget("text") != t: self.afk_btn.configure(text=t)
+
+    def afk_picker(self):
+        if not self.afk_sel: return self.note("AFK list", "There are no accounts yet.")
+        def body(card):
+            row = ctk.CTkFrame(card, fg_color="transparent"); row.pack(pady=(0, 8))
+            self.btn(row, "All", lambda: self.afk_all(True), w=80, h=28).pack(side="left", padx=4)
+            self.btn(row, "None", lambda: self.afk_all(False), w=80, h=28).pack(side="left", padx=4)
+            box = ctk.CTkScrollableFrame(card, width=320, height=min(300, 34 * len(self.afk_sel) + 8), fg_color=FIELD, corner_radius=10)
+            box.pack(padx=34, pady=(0, 18))
+            for n in self.afk_sel: self.afk_box(box, n).pack(anchor="w", padx=8, pady=4)
+        self.confirm("AFK on", "Accounts the Anti-AFK round visits.", [("Done", True)], body=body)
+
+    def fit_afk(self):
+        narrow = self.winfo_width() / self.scale < 1100              # logical width: only the List button when narrow
+        if narrow != self.afk_narrow:
+            self.afk_narrow = narrow
+            if narrow: self.afk_list.pack_forget()
+            else: self.afk_list.pack(fill="x", pady=(4, 0))
 
     def store_account(self, name, cookie, uid):
-        self.cfg["accounts"] = [a for a in self.cfg["accounts"] if a["name"] != name] + \
-                               [{"name": name, "cookie": enc(cookie), "id": uid}]
+        old = self.account(name); rec = {"name": name, "cookie": enc(cookie), "id": uid}
+        if old and old.get("password"): rec["password"] = old["password"]          # re-login keeps the stored password
+        self.cfg["accounts"] = [a for a in self.cfg["accounts"] if a["name"] != name] + [rec]
         self.cookie_ok.pop(name, None); self.refresh(); self.log(f"Added account {name}", "ok")
 
     def add(self):
         c = self.ask("Add account", "Paste the .ROBLOSECURITY cookie\n(treat it like a password):", secret=True)
         if not c: return
         try: uid, name = whoami(c.strip())
-        except Exception as ex: return messagebox.showerror("Invalid cookie", str(ex))
+        except Exception as ex: return self.note("Invalid cookie", str(ex))
         self.store_account(name, c.strip(), uid)
 
     def add_browser(self):
@@ -727,7 +776,7 @@ class App(ctk.CTk):
     def _browser_login(self):
         try: from playwright.sync_api import sync_playwright
         except ImportError:
-            return self.after(0, lambda: messagebox.showerror("Missing package", "Run:  pip install playwright"))
+            return self.after(0, lambda: self.note("Missing package", "Run:  pip install playwright"))
         exe = find_browser()
         if not exe: return self.log("Microsoft Edge or Google Chrome must be installed", "bad")
         tmp, found, proc = tempfile.mkdtemp(prefix="altmgr_"), None, None   # fresh profile = separate session per account
@@ -761,6 +810,59 @@ class App(ctk.CTk):
         if found: self.after(0, lambda: self.store_account(*found))
         else: self.log("Browser login cancelled / timed out", "warn")
 
+    def set_password(self, n):
+        a = self.account(n)
+        if not a: return
+        p = self.ask("Password", f"Password for {n}\nStored encrypted for this Windows user. Empty = remove it.", secret=True)
+        if p is None: return
+        if p: a["password"] = enc(p)
+        else: a.pop("password", None)
+        r = self.rows.get(n)
+        if r: r["pw"].configure(text_color=GREEN if p else TXT)
+        self.log(f"{n}: password {'saved' if p else 'removed'}", status=False)
+
+    def export_accounts(self):
+        if not self.cfg["accounts"]: return self.note("Export accounts", "There are no accounts to export.")
+        if not self.confirm("Export accounts", "The file will contain your cookies and passwords UNENCRYPTED. Anyone who gets it "
+                            "can take over these accounts. Never share it, never upload it, delete it after use.",
+                            [("Export", True), ("Cancel", None)]): return
+        rows = []
+        for a in self.cfg["accounts"]:
+            try: ck = dec(a["cookie"])
+            except Exception: ck = ""
+            r = {"name": a["name"], "id": a.get("id", 0), "cookie": ck}
+            try:
+                if a.get("password"): r["password"] = dec(a["password"])
+            except Exception: pass
+            rows.append(r)
+        path, i = os.path.join(desktop(), "AltManager_export.json"), 2
+        while os.path.exists(path): path, i = os.path.join(desktop(), f"AltManager_export_{i}.json"), i + 1
+        try:
+            with open(path, "w", encoding="utf-8") as fh: json.dump({"accounts": rows}, fh, indent=2, ensure_ascii=False)
+        except Exception as ex: return self.note("Export failed", str(ex)[:200])
+        self.log(f"Exported {len(rows)} account(s) to the Desktop", "ok")
+        self.note("Export done", f"Saved to:\n{path}\n\nIt is NOT encrypted - delete it when you no longer need it.")
+
+    def import_accounts(self):
+        d = os.path.join(desktop(), "AltManager_export.json")
+        p = self.ask("Import accounts", "Path of an AltManager export file (.json).\nAccounts with the same name are replaced.",
+                     default=d if os.path.exists(d) else "")
+        if not p: return
+        try:
+            with open(p.strip().strip('"'), encoding="utf-8") as fh: data = json.load(fh)
+            new = []
+            for r in data["accounts"] if isinstance(data, dict) else data:
+                a = {"name": str(r["name"]), "cookie": enc(str(r["cookie"])), "id": r.get("id", 0)}
+                old = self.account(a["name"])
+                if r.get("password"): a["password"] = enc(str(r["password"]))
+                elif old and old.get("password"): a["password"] = old["password"]
+                new.append(a)
+        except Exception: return self.note("Import failed", "That file could not be read as an AltManager export.")
+        names = {a["name"] for a in new}
+        self.cfg["accounts"] = [a for a in self.cfg["accounts"] if a["name"] not in names] + new
+        for n in names: self.cookie_ok.pop(n, None)
+        self.refresh(); self.log(f"Imported {len(new)} account(s)", "ok")
+
     def remove(self):
         gone = set(self.checked())
         self.cfg["accounts"] = [a for a in self.cfg["accounts"] if a["name"] not in gone]
@@ -772,16 +874,16 @@ class App(ctk.CTk):
         try:
             apply_graphics(self.cfg["fps"], self.cfg["quality"], self.cfg["mute"])
             self.log(f"Graphics lock written (FPS {self.cfg['fps']}, quality {self.cfg['quality']}), file is read-only")
-        except Exception as ex: messagebox.showerror("Settings", str(ex))
+        except Exception as ex: self.note("Settings", str(ex))
 
     def unlock(self):
         try: unlock_settings(); self.log("Graphics settings file unlocked")
-        except Exception as ex: messagebox.showerror("Settings", str(ex))
+        except Exception as ex: self.note("Settings", str(ex))
 
     # ---------- launching / closing / rejoining ----------
     def launch(self):
         self.save(); place = parse_place(self.cfg["place"])
-        if not place: return messagebox.showwarning("Game", "Enter a game ID or roblox.com/games link.")
+        if not place: return self.note("Game", "Enter a game ID or roblox.com/games link.")
         if self.cfg["gfx"]: self.apply_gfx()
         todo = [a for a in self.cfg["accounts"] if a["name"] in self.checked()]
         if todo: self.log(f"Launching {len(todo)} account(s) into place {place}")
@@ -939,10 +1041,11 @@ class App(ctk.CTk):
         fits = True
         if self.cfg["micro"]:
             w, h = max(40, self.cfg["windowWidth"]), max(40, self.cfg["windowHeight"])
-            cols = max(1, tw // w); cw, ch = w, h
+            cols = max(1, tw // w)
             fits = w <= tw and -(-n // cols) * h <= H
-        if not self.cfg["micro"] or not fits: cols, cw, ch, w, h = grid_plan(n, tw, H)   # exact size doesn't fit -> auto
-        slots = [((i % cols) * cw, (i // cols) * ch, w, h) for i in range(n)]
+        if not self.cfg["micro"] or not fits: cols, _, _, w, h = grid_plan(n, tw, H)   # exact size doesn't fit -> auto
+        ox, oy = max(0, (tw - cols * w) // 2), max(0, (H - -(-n // cols) * h) // 2)    # tiles touch each other, block is centered
+        slots = [(ox + (i % cols) * w, oy + (i // cols) * h, w, h) for i in range(n)]
         if multi:
             fw = W - tw; w2 = min(fw, int(H * 16 / 9)); h2 = int(w2 * 9 / 16)
             fr = (tw + (fw - w2) // 2, (H - h2) // 2, w2, h2)
@@ -954,11 +1057,11 @@ class App(ctk.CTk):
         order = self.cfg["view_order"]
         self.windows = dict(sorted(self.windows.items(), key=lambda kv: order.index(kv[0]) if kv[0] in order else len(order)))
         self.collect(); wins = self.live()
-        if not wins: return
+        if not wins: self.placeholder(None); return
         if self.tv.get() != "Viewer": self.tv.set("Viewer")
         self.update_idletasks(); self.fixes.clear()
         if self.maxed in wins:                               # one instance fills the viewer, the rest are hidden
-            W, H = self.stage_size()
+            self.placeholder(None); W, H = self.stage_size()
             for hw in wins:
                 if hw == self.maxed: self.place(hw, (0, 0, W, H))
                 else: self.cell_for(hw).place_forget()
@@ -970,7 +1073,7 @@ class App(ctk.CTk):
         slots, fr, fits = self.plan(len(wins))
         for i, hw in enumerate(wins):
             self.place(hw, fr if hw == self.active else slots[i])
-        self.stage.update_idletasks()
+        self.sync_ph(wins, slots); self.stage.update_idletasks()
         big = sum(1 for i, hw in enumerate(wins) if hw != self.active
                   and (win_rect(hw).right - win_rect(hw).left > slots[i][2] + 3 or win_rect(hw).bottom - win_rect(hw).top > slots[i][3] + 3))
         msg = f"Layout: {len(wins)} windows, tiles {slots[0][2]}x{slots[0][3]}"
@@ -993,6 +1096,28 @@ class App(ctk.CTk):
         else:
             if hw in DOCKED: self.undock(hw, cell)           # just lost focus -> back into its tile
             fit_child(hw, w, h)
+
+    def sync_ph(self, wins, slots):
+        name = next((n for n, h in self.windows.items() if h == self.active), None)
+        show = name and len(wins) > 1 and self.active in wins
+        self.placeholder(slots[wins.index(self.active)] if show else None, name)
+
+    def placeholder(self, rect, name=""):
+        """Tile-styled stand-in for the focused account's grid slot (plain tk widgets, no native window)."""
+        if rect is None:
+            if self.ph: self.ph.place_forget()
+            return
+        if self.ph is None:
+            self.ph = tk.Frame(self.stage, bg=BTN_H, highlightthickness=0, bd=0); self.ph.rgn = None
+            inner = tk.Frame(self.ph, bg=CARD, bd=0)
+            inner.place(x=BORDER, y=BORDER, relwidth=1, relheight=1, width=-2 * BORDER, height=-2 * BORDER)
+            tk.Label(inner, text="Focused", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).place(relx=0.5, rely=0.4, anchor="center")
+            self.ph_name = tk.Label(inner, bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 11))
+            self.ph_name.place(relx=0.5, rely=0.6, anchor="center")
+        x, y, w, h = rect
+        self.ph.place(x=x, y=y, width=w, height=h)
+        if self.ph.rgn != (w, h): self.ph.rgn = (w, h); round_region(self.ph.winfo_id(), w, h, RADIUS)
+        if self.ph_name.cget("text") != name: self.ph_name.configure(text=name)
 
     def cell_for(self, hw):
         cell = self.cells.get(hw)
@@ -1040,6 +1165,7 @@ class App(ctk.CTk):
         EMBEDDED.discard(hw); DOCKED.discard(hw); ORIG_STYLE.pop(hw, None); RGN.pop(hw, None)
         c = self.cells.pop(hw, None)
         if c: c.destroy()
+        if hw == self.active: self.placeholder(None)
 
     def unembed_all(self):
         for hw in list(EMBEDDED): unembed_window(hw)
@@ -1087,7 +1213,7 @@ class App(ctk.CTk):
         if hw not in wins: return
         slots, fr, _ = self.plan(len(wins))
         if old in wins: self.place(old, slots[wins.index(old)])
-        self.place(hw, fr)
+        self.place(hw, fr); self.sync_ph(wins, slots)
         self.stage.update_idletasks()
         self.after(10, self.update_badges); self.after(50, lambda: self.give_focus(hw)); self.after(150, self.verify_layout)
 
@@ -1108,6 +1234,7 @@ class App(ctk.CTk):
         w, h = choice.split("x"); self.v["windowWidth"].set(w); self.v["windowHeight"].set(h); self.retile()
 
     def on_stage(self, _=None):
+        self.fit_afk()
         if self._relayout: self.after_cancel(self._relayout)
         self._relayout = self.after(200, self._do_relayout)
 
@@ -1288,6 +1415,36 @@ class App(ctk.CTk):
             kernel32.CloseHandle(hp)
         if ok or blocked: self.log(f"RAM trim: {ok} trimmed, {blocked} blocked", "ok" if ok else "warn")
 
+    # ---------- global hotkeys (RegisterHotKey on one idle thread; costs nothing until a key is pressed) ----------
+    HK_KEYS = [(i, 0x30 + i, str(i)) for i in range(1, 10)] + [(10, 0x25, "Left"), (11, 0x27, "Right")]
+
+    def hotkeys(self, on):
+        th = self.hk_thread
+        if on and not (th and th.is_alive()):
+            self.hk_thread = threading.Thread(target=self._hk_loop, daemon=True); self.hk_thread.start()
+        elif not on and th and th.is_alive():
+            user32.PostThreadMessageW(self.hk_tid, 0x0012, 0, 0); th.join(1)       # WM_QUIT; the thread unregisters itself
+
+    def _hk_loop(self):
+        msg = wt.MSG()
+        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)                      # creates this thread's message queue
+        self.hk_tid = kernel32.GetCurrentThreadId()
+        bad = [f"Ctrl+Shift+{name}" for i, vk, name in self.HK_KEYS if not user32.RegisterHotKey(None, i, 0x4006, vk)]
+        if bad: self.log("Hotkeys unavailable (used by another program): " + ", ".join(bad), "warn", status=False)
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == 0x0312: self.after(0, lambda i=int(msg.wParam): self.hotkey(i))
+        for i, _, _ in self.HK_KEYS: user32.UnregisterHotKey(None, i)
+
+    def hotkey(self, i):
+        if self.modal or self.busy: return
+        alive = self.live(); names = [n for n, h in self.windows.items() if h in alive]
+        if not names: return
+        if i <= 9: idx = i - 1
+        else:
+            cur = next((k for k, n in enumerate(names) if self.windows[n] == self.active), -1)
+            idx = (cur + (-1 if i == 10 else 1)) % len(names)
+        if idx < len(names): self.show(names[idx])
+
     # ---------- anti-AFK: visit each instance and click for real (a tile can't hold OS focus) ----------
     def run_seq(self, steps):
         if not steps: return
@@ -1363,7 +1520,7 @@ class App(ctk.CTk):
         """Download the file behind the update link; install it only if it is valid and has a higher VERSION."""
         url = self.cfg["update_url"].strip() or UPDATE_URL
         if not url.lower().startswith("https://"):
-            if manual: self.after(0, lambda: messagebox.showinfo("Updates", "Enter an https:// update link in Settings first."))
+            if manual: self.after(0, lambda: self.note("Updates", "Enter an https:// update link in Settings first."))
             return
         try:
             url = re.sub(r"^https://github\.com/([^/]+/[^/]+)/blob/", r"https://raw.githubusercontent.com/\1/", url)   # web-page link -> raw file
@@ -1395,7 +1552,7 @@ class App(ctk.CTk):
     def restart(self):
         self.save()
         subprocess.Popen([sys.executable, os.path.abspath(__file__)], creationflags=0x00000008)   # DETACHED_PROCESS
-        self.log("Restarting for update", status=False); self.unembed_all(); self.destroy()
+        self.log("Restarting for update", status=False); self.hotkeys(False); self.unembed_all(); self.destroy()
 
     # ---------- exit ----------
     def on_exit(self):
@@ -1408,7 +1565,7 @@ class App(ctk.CTk):
             if ans:
                 for hw in list(self.windows.values()): kill_pid(pid_of(hw))
         self.save(); self.log("AltManager closed", status=False)
-        self.unembed_all(); self.destroy()
+        self.hotkeys(False); self.unembed_all(); self.destroy()
 
 if __name__ == "__main__":
     App().mainloop()
