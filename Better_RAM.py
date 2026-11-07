@@ -1,7 +1,7 @@
 """
-AltManager v15 - Windows only.
+AltManager v16 - Windows only.
     pip install customtkinter requests psutil playwright
-    python alt_manager_v13.py
+    python Better_RAM.py   (relaunches itself without a console window; add --console to keep it)
 
 Layout: small embedded tiles on the left, the focused instance docked as a real window over the right pane.
 Tabs: Dashboard (accounts) | Viewer | Log (timestamped events) | Settings.
@@ -11,6 +11,11 @@ import atexit, base64, ctypes, ctypes.wintypes as wt, json, os, random, re, shut
 import tkinter as tk
 from tkinter import messagebox
 from urllib.parse import quote
+
+if os.name == "nt" and os.path.basename(sys.executable).lower() == "python.exe" and "--console" not in sys.argv:
+    _pw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")      # same Python, no console window
+    if os.path.exists(_pw):
+        subprocess.Popen([_pw, os.path.abspath(__file__)], creationflags=0x00000008, close_fds=True); sys.exit()
 
 try: ctypes.windll.shcore.SetProcessDpiAwareness(2)   # real pixels, not scaled (must run before any window exists)
 except Exception: pass
@@ -351,6 +356,8 @@ class Badge(tk.Frame):
 ctk.set_appearance_mode("dark")
 
 class App(ctk.CTk):
+    modal = False                    # True while an in-app prompt is open (docked game windows are hidden)
+
     def __init__(self):
         super().__init__()
         global BORDER, RADIUS
@@ -420,6 +427,30 @@ class App(ctk.CTk):
         ctk.CTkCheckBox(f, text=label, variable=v, onvalue=True, offvalue=False, corner_radius=7,
                         fg_color=TXT, hover_color="#ffffff", checkmark_color=BG, border_color=BTN_H,
                         text_color=TXT).pack(side="left", padx=(0, 24))
+
+    def confirm(self, title, text, buttons):
+        """In-app prompt drawn over the whole window. Docked game windows are hidden meanwhile so nothing can cover it.
+        buttons = [(label, value), ...]; the first one is the primary action. Returns the clicked value."""
+        if self.modal: return None
+        self.modal = True
+        hidden = [h for h in DOCKED if user32.IsWindow(h)]
+        for h in hidden: user32.ShowWindow(h, 0)
+        ov = ctk.CTkFrame(self, fg_color=BG, corner_radius=0); ov.place(x=0, y=0, relwidth=1, relheight=1); ov.lift()
+        card = ctk.CTkFrame(ov, fg_color=CARD, corner_radius=18); card.place(relx=0.5, rely=0.4, anchor="center")
+        ctk.CTkLabel(card, text=title, font=("Segoe UI Semibold", 17), text_color=TXT).pack(padx=34, pady=(26, 6))
+        ctk.CTkLabel(card, text=text, justify="left", text_color=MUTED, wraplength=420).pack(padx=34, pady=(0, 18))
+        out = tk.StringVar(); res = {}
+        def pick(i): res["v"] = buttons[i][1]; out.set("x")
+        row = ctk.CTkFrame(card, fg_color="transparent"); row.pack(pady=(0, 26))
+        for i, (label, _) in enumerate(buttons):
+            self.btn(row, label, lambda i=i: pick(i), primary=(i == 0), w=130).pack(side="left", padx=6)
+        ov.bind("<Escape>", lambda _: pick(len(buttons) - 1)); ov.focus_set()
+        self.wait_variable(out)
+        ov.destroy(); self.modal = False
+        for h in hidden:
+            if user32.IsWindow(h): user32.ShowWindow(h, 4)       # SW_SHOWNOACTIVATE
+        self.after(50, self.retile); self.after(150, self.verify_layout)
+        return res["v"]
 
     def ask(self, title, prompt, secret=False):
         d = ctk.CTkToplevel(self); d.title(title); d.geometry("480x210"); d.configure(fg_color=CARD)
@@ -1017,6 +1048,7 @@ class App(ctk.CTk):
     def top_hwnd(self): return user32.GetAncestor(self.winfo_id(), 2)
 
     def dock(self, hw):
+        if self.modal: return
         x, y, w, h = self.dock_local
         sx, sy = self.stage.winfo_rootx() + x, self.stage.winfo_rooty() + y
         fresh = hw not in DOCKED
@@ -1358,7 +1390,7 @@ class App(ctk.CTk):
         n = len(self.live())
         msg = f"AltManager v{new} was downloaded and installed.\n\nRestart now to use it?"
         if n: msg += f"\n\n{n} Roblox window(s) will be released to the desktop (not closed)."
-        if messagebox.askyesno("Update installed", msg): self.restart()
+        if self.confirm("Update installed", msg, [("Restart", True), ("Later", False)]): self.restart()
 
     def restart(self):
         self.save()
@@ -1367,9 +1399,11 @@ class App(ctk.CTk):
 
     # ---------- exit ----------
     def on_exit(self):
+        if self.modal: return
         if self.windows:
-            ans = messagebox.askyesnocancel("Close AltManager",
-                "Close the Roblox instances too?\n\nYes = close them\nNo = release them to the desktop\nCancel = stay open")
+            ans = self.confirm("Close AltManager",
+                "Close the Roblox instances too?\n\nClose them = shut every Roblox window\nRelease = leave them open on the desktop",
+                [("Close them", True), ("Release", False), ("Cancel", None)])
             if ans is None: return
             if ans:
                 for hw in list(self.windows.values()): kill_pid(pid_of(hw))
