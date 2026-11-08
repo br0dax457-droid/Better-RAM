@@ -23,7 +23,7 @@ except Exception: pass
 try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("BetterRAM.App")   # own taskbar identity -> own icon
 except Exception: pass
 
-VERSION = 34                       # bump this in the file you publish; running copies update when it is higher
+VERSION = 35                       # bump this in the file you publish; running copies update when it is higher
 UPDATE_URL = "https://raw.githubusercontent.com/br0dax457-droid/Better-RAM/main/Better_RAM.py"   # built-in update link
 
 # ======================= dependencies: install what's missing, re-check weekly =======================
@@ -1092,6 +1092,8 @@ class App(ctk.CTk):
         self.started[n] = time.time(); self.launch_info[n] = (place, job)
         if n in self.cfg["idle_prio"]: self.set_priority(n, 0x40)
         self.retile()
+        for ms in (8000, 20000, 40000):                      # after the game finished joining: refresh a tile stuck on old frames
+            self.after(ms, lambda h=hw: self.nudge(h))
 
     def kill_instance(self, n, status="Closed"):
         hw = self.windows.pop(n, None)
@@ -1390,6 +1392,18 @@ class App(ctk.CTk):
         user32.SetWindowPos(hw, 0, x, y, w + d, h + d, SWP_NOZORDER | SWP_NOACTIVATE)
         if grow: self.after(60, lambda: self.kick(hw, False))
 
+    def nudge(self, hw, grow=True):
+        """Tiles can keep showing the first frames after joining (join banners etc.) until the window's size changes.
+        Grow the tile by 1 px, then put the real size back 80 ms later: the game re-creates its surface and repaints."""
+        c = self.cells.get(hw)
+        if not c or hw in DOCKED or not user32.IsWindow(hw) or not c.winfo_ismapped() or self.tv.get() != "Viewer": return
+        d = 1 if grow else 0
+        user32.SetWindowPos(hw, HWND_TOP, BORDER, BORDER, c.winfo_width() - 2 * BORDER + d, c.winfo_height() - 2 * BORDER + d, SWP_NOACTIVATE)
+        if grow: self.after(80, lambda: self.nudge(hw, False))
+
+    def nudge_all(self):
+        for i, hw in enumerate(list(self.cells)): self.after(i * 120, lambda h=hw: self.nudge(h))
+
     def set_active_label(self):
         name = next((n for n, h in self.windows.items() if h == self.active), None)
         self.active_label.configure(text=f"Focused: {name}" if name else "Focused: -")
@@ -1675,7 +1689,7 @@ class App(ctk.CTk):
             if r and a["name"] not in self.windows:
                 bad = self.cookie_ok.get(a["name"]) is False
                 put(r, "st", "Cookie expired - re-login" if bad else "Idle", RED if bad else MUTED); put(r, "cpu", ""); put(r, "ram", "")
-        self.update_rows()
+        self.update_rows(); self.nudge_all()
         threading.Thread(target=self._refresh_presence, daemon=True).start()
 
     def _refresh_presence(self):
