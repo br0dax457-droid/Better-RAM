@@ -7,6 +7,35 @@ Layout: small embedded tiles on the left, the focused instance docked as a real 
 Tabs: Dashboard (accounts + log) | Viewer | Settings.
 Uses the same accounts file (%APPDATA%\\AltManager.json) as every earlier version.
 """
+
+# =====================================================================================================================
+# NOTES FOR WHOEVER EDITS THIS FILE NEXT (a person or a brand new AI chat) - read this first
+#  1. Every function and class gets a comment on the line directly above it saying WHAT it does and WHEN it was made,
+#     e.g.  "# Shows the GPU % of each account (added v37)."  When you change an existing function later, keep its comment
+#     and append what changed, e.g.  "(added v37; changed v39: also shows VRAM)".  New functions: write the comment first.
+#     Functions tagged "(v28 or earlier)" existed in the first version this history starts from.
+#  2. Bump VERSION on every change you publish: running copies only update when the published file has a higher number.
+#  3. Do not touch UPDATE_URL, and keep the data/config file format backward compatible (a new setting goes into DEFAULTS
+#     with a default value; old files must keep loading).
+#  4. Native dialogs are forbidden while a game window is docked: use self.note / self.confirm / self.ask (in-app prompts).
+#  5. Background threads must never touch Tk widgets or self.windows directly: hand the work over with self.after(0, ...).
+#  6. Layout rules: the Dashboard columns are locked 60/40 and the summary labels have fixed widths on purpose, so changing
+#     numbers never resize the UI. Keep new labels fixed-width and keep the window's minimum size.
+#
+# CHANGE HISTORY (newest last)
+#  v29  GPU column + summary; saved-game 'Accounts will join' line and delete confirmation; status line moved to the top
+#  v30  Viewer bottom strip: Anti-AFK now / Anti-AFK / Connection watch stacked on the left, AFK account list on the right
+#  v31-32  AFK account list is a grid of equal cells, vertical scrollbar only when more than 3 rows are needed
+#  v33  Drag a tile onto the 'Focused' placeholder (or the placeholder onto a tile) to switch; status line removed,
+#       hints (say) now go to the log panel
+#  v34  'Trim now' button removed (automatic trim stays)
+#  v35  Tile repaint nudge (nudge / nudge_all) for tiles stuck on old frames
+#  v36  Tighter padding, locked 60/40 columns, fixed-width summary, outdated-Roblox check, Roll call view, 'In game' timer
+#  v37  Join-user mode (saved users, error messages), Performance view (VRAM, disk read/write), tile-area limits shown
+#       in Settings, saved-games card halved, comments restored and documented
+#  v38  Docked game window follows the manager: 200 ms when idle, 10 ms (with a 1 ms Windows timer) while the manager is being
+#       moved, instant re-dock on tab change (kick_track / on_move / track_dock)
+# =====================================================================================================================
 import atexit, base64, ctypes, ctypes.wintypes as wt, json, os, random, re, shutil, socket, stat, struct, subprocess, sys, tempfile, threading, time
 import tkinter as tk
 from tkinter import messagebox
@@ -23,7 +52,7 @@ except Exception: pass
 try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("BetterRAM.App")   # own taskbar identity -> own icon
 except Exception: pass
 
-VERSION = 35                       # bump this in the file you publish; running copies update when it is higher
+VERSION = 38                       # bump this in the file you publish; running copies update when it is higher
 UPDATE_URL = "https://raw.githubusercontent.com/br0dax457-droid/Better-RAM/main/Better_RAM.py"   # built-in update link
 
 # ======================= dependencies: install what's missing, re-check weekly =======================
@@ -31,6 +60,7 @@ DEPS = {"customtkinter": "customtkinter", "requests": "requests", "psutil": "psu
 CORE = ("customtkinter", "requests", "psutil")           # needed to start (playwright is only for "Add via browser")
 DEPS_STAMP = os.path.join(os.getenv("APPDATA", "."), "AltManager.deps.json")
 
+# Startup check: installs or updates missing pip packages in a small progress window before the app loads (v28 or earlier).
 def ensure_dependencies():
     import importlib, importlib.util
     try: stamp = json.load(open(DEPS_STAMP))
@@ -40,6 +70,7 @@ def ensure_dependencies():
     stale = stamp.get("deps") != names or time.time() - stamp.get("checked", 0) > 7 * 86400
     if not missing and not stale: return                 # fast path: straight to the app, no pip, no window
     out = {}
+    # Background thread that runs pip install for ensure_dependencies.
     def work():
         try:
             out["r"] = subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "--disable-pip-version-check", "-q",
@@ -50,6 +81,7 @@ def ensure_dependencies():
     root = tk.Tk(); root.title("Better RAM"); root.configure(bg="#08080a"); root.geometry("380x90"); root.resizable(False, False)
     tk.Label(root, text="Installing required packages..." if missing else "Checking for package updates...",
              bg="#08080a", fg="#ececee", font=("Segoe UI", 11)).pack(expand=True)
+    # Polls until pip has finished, then closes the progress window.
     def wait():
         if t.is_alive(): root.after(200, wait)
         else: root.destroy()
@@ -103,17 +135,29 @@ DEFAULTS = {"accounts": [], "games": [], "place": "", "delay": 6,
             "trim": True, "trim_sec": 90, "lowprio": True,
             "afk": False, "afk_min": 8, "afk_off": 8, "afk_gap": 1200,
             "watch": True, "watch_sec": 60, "auto_rejoin": False, "afk_skip": [], "idle_prio": [], "view_order": [],
-            "update_url": "", "auto_update": True, "hotkeys": True}
-STR_KEYS = {"place", "update_url"}
+            "update_url": "", "auto_update": True, "hotkeys": True, "compact": False, "perf": False,
+            "join_mode": "game", "join_user": "", "users": []}
+STR_KEYS = {"place", "update_url", "join_user"}
+USER_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 
 # ======================= GPU usage (Windows "GPU Engine" performance counters) =======================
 class _PdhVal(ctypes.Structure): _fields_ = [("CStatus", ctypes.c_ulong), ("d", ctypes.c_double)]
+# ctypes layout of one (name, value) entry returned by the Windows performance-counter API; used by gpu_sample (added v29).
 class _PdhItem(ctypes.Structure): _fields_ = [("name", ctypes.c_wchar_p), ("val", _PdhVal)]
 _GPU_RE = re.compile(r"pid_(\d+)_luid_(\S+?)_phys_(\d+)_eng_\d+_engtype_(\w+)", re.I)
 
+# Reads every instance of a wildcard performance counter as (name, status, value) rows (added v37).
+def _pdh_array(pdh, counter):
+    size, cnt = ctypes.c_ulong(0), ctypes.c_ulong(0)
+    pdh.PdhGetFormattedCounterArrayW(counter, 0x200, ctypes.byref(size), ctypes.byref(cnt), None)
+    if not size.value: return []
+    buf = ctypes.create_string_buffer(size.value)
+    if pdh.PdhGetFormattedCounterArrayW(counter, 0x200, ctypes.byref(size), ctypes.byref(cnt), buf) != 0: return None
+    items = ctypes.cast(buf, ctypes.POINTER(_PdhItem))
+    return [(items[i].name or "", items[i].val.CStatus, items[i].val.d) for i in range(cnt.value)]
+
 def gpu_sample(wait=1.0):
-    """-> ({pid: gpu %}, total gpu %) or None when the counters are unavailable. Same maths as Task Manager:
-    sum per engine type, then the busiest engine type counts. A fresh query each time so new processes are seen."""
+    """-> ({pid: gpu %}, total gpu %, {pid: dedicated VRAM bytes} or None) or None when the counters are unavailable."""
     try:
         pdh = ctypes.windll.pdh
         pdh.PdhOpenQueryW.argtypes = [ctypes.c_wchar_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)]
@@ -122,28 +166,33 @@ def gpu_sample(wait=1.0):
         pdh.PdhCloseQuery.argtypes = [ctypes.c_void_p]
         pdh.PdhGetFormattedCounterArrayW.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
                                                       ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p]
-        q, c = ctypes.c_void_p(), ctypes.c_void_p()
+        q, c, cm = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
         if pdh.PdhOpenQueryW(None, 0, ctypes.byref(q)) != 0: return None
         try:
             if pdh.PdhAddEnglishCounterW(q, r"\GPU Engine(*)\Utilization Percentage", 0, ctypes.byref(c)) != 0: return None
+            has_mem = pdh.PdhAddEnglishCounterW(q, r"\GPU Process Memory(*)\Dedicated Usage", 0, ctypes.byref(cm)) == 0
             pdh.PdhCollectQueryData(q); time.sleep(wait); pdh.PdhCollectQueryData(q)
-            size, cnt = ctypes.c_ulong(0), ctypes.c_ulong(0)
-            pdh.PdhGetFormattedCounterArrayW(c, 0x200, ctypes.byref(size), ctypes.byref(cnt), None)    # PDH_FMT_DOUBLE, size query
-            if not size.value: return {}, 0.0
-            buf = ctypes.create_string_buffer(size.value)
-            if pdh.PdhGetFormattedCounterArrayW(c, 0x200, ctypes.byref(size), ctypes.byref(cnt), buf) != 0: return None
-            items = ctypes.cast(buf, ctypes.POINTER(_PdhItem))
+            rows = _pdh_array(pdh, c)
+            if rows is None: return None
             per, tot = {}, {}
-            for i in range(cnt.value):
-                it = items[i]; m = _GPU_RE.search(it.name or "")
-                if not m or it.val.CStatus not in (0, 1): continue
+            for name, status, val in rows:
+                m = _GPU_RE.search(name)
+                if not m or status not in (0, 1): continue
                 pid, adapter, eng = int(m.group(1)), (m.group(2), m.group(3)), m.group(4).lower()
-                v = max(0.0, it.val.d)
+                v = max(0.0, val)
                 per[(pid, adapter, eng)] = per.get((pid, adapter, eng), 0.0) + v
                 tot[(adapter, eng)] = tot.get((adapter, eng), 0.0) + v
             by_pid = {}
             for (pid, _, _), v in per.items(): by_pid[pid] = max(by_pid.get(pid, 0.0), v)
-            return {p: min(100.0, v) for p, v in by_pid.items()}, min(100.0, max(tot.values(), default=0.0))
+            vram = None
+            if has_mem:
+                mem = _pdh_array(pdh, cm)
+                if mem is not None:
+                    vram = {}
+                    for name, status, val in mem:
+                        m = re.search(r"pid_(\d+)_", name)
+                        if m and status in (0, 1): vram[int(m.group(1))] = vram.get(int(m.group(1)), 0.0) + max(0.0, val)
+            return {p: min(100.0, v) for p, v in by_pid.items()}, min(100.0, max(tot.values(), default=0.0)), vram
         finally: pdh.PdhCloseQuery(q)
     except Exception: return None
 
@@ -151,6 +200,7 @@ def gpu_sample(wait=1.0):
 class BLOB(ctypes.Structure):
     _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
 
+# Encrypts/decrypts bytes with Windows DPAPI (tied to this Windows user); this is how saved cookies are protected (v28 or earlier).
 def _dpapi(data: bytes, encrypt: bool) -> bytes:
     buf = ctypes.create_string_buffer(data, len(data))
     inb = BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
@@ -185,6 +235,7 @@ def roblox_post(url, cookie, body=None):
         r = requests.post(url, headers=h, cookies=c, data=data, timeout=15)
     return r
 
+# Asks Roblox for a one-time login ticket for a cookie; raises 'No ticket' when the cookie is expired (v28 or earlier).
 def auth_ticket(cookie):
     t = roblox_post("https://auth.roblox.com/v1/authentication-ticket", cookie).headers.get("rbx-authentication-ticket")
     if not t: raise RuntimeError("No ticket - cookie expired or invalid")
@@ -196,6 +247,7 @@ def presence_type(cookie, uid):
     r.raise_for_status()
     return r.json()["userPresences"][0]["userPresenceType"]
 
+# Builds the roblox-player: link that starts the game; a job id joins that exact server (v28 or earlier).
 def launch_uri(ticket, place, job=""):
     bt = random.randint(10**10, 10**11)
     req = f"RequestGameJob&gameId={job}" if job else "RequestGame"
@@ -205,19 +257,76 @@ def launch_uri(ticket, place, job=""):
             f"+placelauncherurl:{quote(pl, safe='')}+browsertrackerid:{bt}"
             f"+robloxLocale:en_us+gameLocale:en_us+channel:+LaunchExp:InApp")
 
+# Pulls the numeric place id out of a typed ID or a roblox.com/games link (v28 or earlier).
 def parse_place(text):
     m = re.search(r"games/(\d+)", text) or re.search(r"(\d{5,})", text)
     return m.group(1) if m else ""
 
+PERF_COLS = (("", 12, "w"), ("Account", 120, "w"), ("CPU", 46, "e"), ("GPU", 46, "e"), ("VRAM", 64, "e"),
+             ("RAM", 68, "e"), ("Read", 74, "e"), ("Write", 74, "e"))
+PERF_PAD = 3
+
+def short_status(t):
+    """Roll-call view: one short word per account."""
+    if "outdated" in t: return "Outdated"
+    t = t.split(" (")[0].split(" - ")[0]
+    return {"Disconnected": "Offline", "Cookie expired": "Re-login", "Crashed / closed": "Crashed"}.get(t, t)
+
+# Formats seconds as '<1m', '12m' or '1h 05m' for the 'In game' timer (added v36).
+def fmt_dur(sec):
+    m = int(sec // 60); h, m = divmod(m, 60)
+    return "<1m" if sec < 60 else (f"{h}h {m:02d}m" if h else f"{m}m")
+
+# Formats a byte count as MB or GB for the VRAM column (added v37).
+def fmt_bytes(b):
+    return f"{b/1073741824:.1f} GB" if b >= 1073741824 else f"{b/1048576:.0f} MB"
+
+# Formats bytes per second as KB/s or MB/s for the disk columns (added v37).
+def fmt_rate(bps):
+    return f"{bps/1048576:.1f} MB/s" if bps >= 1048576 else f"{bps/1024:.0f} KB/s"
+
+def resolve_user(name, cookies):
+    """-> (place id, job id, shown name, error text). Looks up where a Roblox user is playing right now."""
+    if not cookies: return "", "", name, "None of the selected accounts has a valid login to look the user up with."
+    try:
+        r = roblox_post("https://users.roblox.com/v1/usernames/users", cookies[0], {"usernames": [name], "excludeBannedUsers": False})
+        r.raise_for_status(); data = r.json().get("data") or []
+    except Exception: return "", "", name, "Couldn't reach Roblox to look that user up. Try again in a moment."
+    if not data: return "", "", name, f'There is no Roblox user called "{name}" - check the spelling.'
+    uid, shown = data[0]["id"], data[0]["name"]
+    seen = set()
+    for ck in cookies:
+        try:
+            r = roblox_post("https://presence.roblox.com/v1/presence/users", ck, {"userIds": [uid]}); r.raise_for_status()
+            p = r.json()["userPresences"][0]
+        except Exception: seen.add("net"); continue
+        t = p.get("userPresenceType", 0); place = p.get("placeId") or p.get("rootPlaceId"); job = p.get("gameId")
+        if t == 2 and place and job: return str(place), job, shown, ""
+        seen.add("blocked" if t == 2 else "studio" if t == 3 else "offline")
+    if "blocked" in seen:
+        return "", "", shown, (f"{shown} is in a game, but their privacy settings (who can join them) don't let your accounts join. "
+                               "Ask them to allow it, or make one of your accounts their friend.")
+    if "studio" in seen: return "", "", shown, f"{shown} is in Roblox Studio, not in a game."
+    if "offline" in seen: return "", "", shown, f"{shown} isn't in a game right now (offline, on the website, or hidden by their privacy settings)."
+    return "", "", shown, "Couldn't reach Roblox to check where that user is. Try again in a moment."
+
+RBX_VERSION_URL = "https://clientsettingscdn.roblox.com/v2/client-version/WindowsPlayer"
+
 def put(r, key, text, color=None):
-    """Update a dashboard label only if its text/colour actually changed (CTk redraws are expensive)."""
+    """Update a dashboard label only if its text/colour actually changed (CTk redraws are expensive).
+    Keys a row does not have (roll-call rows only show the status) are skipped."""
+    w = r.get(key)
+    if w is None: return
+    if key == "st" and r.get("short"): text = short_status(text)
     if r.get(key + "_v") == (text, color): return
     r[key + "_v"] = (text, color)
-    r[key].configure(text=text, **({"text_color": color} if color else {}))
+    w.configure(text=text, **({"text_color": color} if color else {}))
 
 def _icon_bytes():
     """Default icon, drawn in code (no image file needed): two small tiles + one big focused tile. Classic 32-bit .ico."""
+    # Draws one pixel layer of the default app icon in code, so no image file is needed (v28 or earlier).
     def layer(u, v):
+        # Tells whether a point lies inside a rounded square (icon drawing helper) (v28 or earlier).
         def rr(x0, y0, x1, y1, r):
             dx, dy = max(x0 + r - u, 0, u - (x1 - r)), max(y0 + r - v, 0, v - (y1 - r))
             return dx * dx + dy * dy <= r * r
@@ -250,11 +359,13 @@ def app_icon():
         with open(path, "wb") as fh: fh.write(_icon_bytes())
     return path
 
+# Path of the user's real Desktop folder (follows OneDrive redirects) (v28 or earlier).
 def desktop():
     buf = ctypes.create_unicode_buffer(260)
     if ctypes.windll.shell32.SHGetFolderPathW(0, 0x10, 0, 0, buf) == 0 and buf.value: return buf.value   # follows OneDrive redirects
     return os.path.join(os.path.expanduser("~"), "Desktop")
 
+# Finds Edge or Chrome for 'Add account via browser' (v28 or earlier).
 def find_browser():
     for rel in (r"Microsoft\Edge\Application\msedge.exe", r"Google\Chrome\Application\chrome.exe"):
         for env in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
@@ -268,9 +379,11 @@ SKELETON = ('<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" '
             'xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">'
             '<Item class="UserGameSettings" referent="RBX0"><Properties></Properties></Item></roblox>')
 
+# Makes Roblox's settings file writable again (undoes the read-only lock) (v28 or earlier).
 def unlock_settings():
     if os.path.exists(SETTINGS): os.chmod(SETTINGS, stat.S_IREAD | stat.S_IWRITE)
 
+# Writes FPS cap, quality level and mute into Roblox's settings file, then locks it read-only so Roblox can't reset it (v28 or earlier).
 def apply_graphics(fps, quality, mute):
     os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
     if os.path.exists(SETTINGS):
@@ -302,8 +415,10 @@ STRIP_EX = WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_DLGMODALFRAME | WS_EX_APP
 
 WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
 
+# Lists all visible Roblox game windows (window class WINDOWSCLIENT) (v28 or earlier).
 def roblox_windows():
     found = []
+    # EnumWindows callback that collects Roblox windows for roblox_windows.
     def cb(h, _):
         if user32.IsWindowVisible(h):
             b = ctypes.create_unicode_buffer(64)
@@ -313,30 +428,38 @@ def roblox_windows():
     user32.EnumWindows(WNDENUMPROC(cb), 0)
     return found
 
+# Process ids of all running RobloxPlayerBeta.exe processes (v28 or earlier).
 def roblox_pids():
     try: return {p.pid for p in psutil.process_iter(["name"]) if (p.info["name"] or "").lower() == "robloxplayerbeta.exe"}
     except Exception: return set()
 
+# Process id that owns a window handle (v28 or earlier).
 def pid_of(h):
     p = wt.DWORD(); user32.GetWindowThreadProcessId(h, ctypes.byref(p)); return p.value
 
+# Screen rectangle of a window (v28 or earlier).
 def win_rect(h):
     r = wt.RECT(); user32.GetWindowRect(h, ctypes.byref(r)); return r
 
+# Window area in pixels; used to pick the real game window over the small splash window (v28 or earlier).
 def win_area(h):
     r = win_rect(h); return (r.right - r.left) * (r.bottom - r.top)
 
+# Force-closes a process by id (v28 or earlier).
 def kill_pid(pid):
     try: subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, creationflags=0x08000000)
     except Exception: pass
 
+# True while the Roblox installer/updater is running; launches wait for it to finish (v28 or earlier).
 def installer_running():
     try: return any((p.info["name"] or "").lower() == "robloxplayerinstaller.exe" for p in psutil.process_iter(["name"]))
     except Exception: return False
 
+# ctypes struct for the Windows 'last user input' query (v28 or earlier).
 class LASTINPUTINFO(ctypes.Structure):
     _fields_ = [("cbSize", wt.UINT), ("dwTime", wt.DWORD)]
 
+# Seconds since the user last touched mouse or keyboard; Anti-AFK waits until the user is idle (v28 or earlier).
 def user_idle_seconds():
     li = LASTINPUTINFO(); li.cbSize = ctypes.sizeof(li)
     user32.GetLastInputInfo(ctypes.byref(li))
@@ -346,12 +469,14 @@ def user_idle_seconds():
 ORIG_STYLE = {}                   # hwnd -> original (style, exstyle), restored on release
 EMBEDDED, DOCKED = set(), set()   # every window we modified / the subset currently docked as a real window
 
+# Strips borders/title bar from a game window and remembers its original style so it can be restored later (v28 or earlier).
 def _restyle(hw, add, add_ex=0):
     st = user32.GetWindowLongPtrW(hw, GWL_STYLE); ex = user32.GetWindowLongPtrW(hw, GWL_EXSTYLE)
     ORIG_STYLE.setdefault(hw, (st, ex))
     user32.SetWindowLongPtrW(hw, GWL_STYLE, ((st & 0xFFFFFFFF) & ~STRIP) | add)
     user32.SetWindowLongPtrW(hw, GWL_EXSTYLE, (ex & ~(STRIP_EX | WS_EX_LAYERED)) | add_ex)
 
+# Turns a game window into a child of a viewer tile (small-tile mode) (v28 or earlier).
 def embed_window(hw, parent):
     _restyle(hw, WS_CHILD | WS_VISIBLE)
     user32.SetParent(hw, parent)
@@ -373,9 +498,11 @@ BORDER, RADIUS = 2, 10           # tile border thickness / corner radius (px)
 
 RGN = {}                          # hwnd -> (w, h) of the clip region already applied to a game window
 
+# Clips a window to rounded corners (v28 or earlier).
 def round_region(hw, w, h, r):
     user32.SetWindowRgn(hw, gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, r * 2, r * 2), True)
 
+# Removes the rounded-corner clip from a window (v28 or earlier).
 def clear_region(hw):
     RGN.pop(hw, None); user32.SetWindowRgn(hw, None, True)
 
@@ -385,6 +512,7 @@ def fit_child(hw, w, h):
     user32.SetWindowPos(hw, HWND_TOP, BORDER, BORDER, iw, ih, SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW)
     if RGN.get(hw) != (iw, ih): RGN[hw] = (iw, ih); round_region(hw, iw, ih, RADIUS - BORDER)
 
+# Gives a game window back to the desktop with its original style (v28 or earlier).
 def unembed_window(hw):
     EMBEDDED.discard(hw); DOCKED.discard(hw)
     if not user32.IsWindow(hw): return
@@ -409,6 +537,7 @@ def grid_plan(n, W, H):
 class Badge(tk.Frame):
     """Username tag drawn inside the window's own tile and kept above the Roblox child window.
     Click = focus that account, press-and-drag onto another tile = reorder, onto the Focused tile = switch with it."""
+    # Builds the username tag drawn on each tile: status dot + name, with click / drag / drop callbacks (v28 or earlier).
     def __init__(self, cell, text, on_click, on_drag, on_drop):
         super().__init__(cell, bg="#000000", highlightthickness=0, bd=0)
         self.dot = tk.Label(self, text="●", bg="#000000", fg=GREEN, font=("Segoe UI", 8))
@@ -421,19 +550,24 @@ class Badge(tk.Frame):
             w.bind("<Button-1>", self._down); w.bind("<B1-Motion>", self._move); w.bind("<ButtonRelease-1>", self._up)
         self.place(x=4, y=4)
 
+    # Mouse press on a tag: remembers where the press started.
     def _down(self, e): self.press, self.moved = (e.x_root, e.y_root), False
 
+    # Mouse move on a tag: after 8 px of movement it counts as a drag and calls the drag callback.
     def _move(self, e):
         if self.press and (self.moved or abs(e.x_root - self.press[0]) + abs(e.y_root - self.press[1]) > 8):
             self.moved = True; self.cbs[1](e)
 
+    # Mouse release on a tag: a plain click focuses the account, a drag ends with the drop callback.
     def _up(self, e):
         if self.press: self.cbs[2](e) if self.moved else self.cbs[0]()
         self.press, self.moved = None, False
 
+    # Changes the colour of the tag's status dot only when it differs (avoids redraws).
     def set_color(self, c):
         if self.dot.cget("fg") != c: self.dot.configure(fg=c)
 
+    # Keeps the tag on top of the game window inside its tile.
     def raise_above(self, cell_hwnd):
         bh = self.winfo_id()
         if user32.GetWindow(cell_hwnd, 5) != bh:                   # GW_CHILD = current top child
@@ -442,10 +576,12 @@ class Badge(tk.Frame):
 # ======================= App =======================
 ctk.set_appearance_mode("dark")
 
+# Main application window: all UI, launching, viewer tiling and the monitoring threads (v28 or earlier); extended through v37.
 class App(ctk.CTk):
     modal = False                    # True while an in-app prompt is open (docked game windows are hidden)
     cancel = None                    # closes that prompt (same as its last button)
 
+    # Loads config, creates all state dictionaries and the window, builds the UI and starts the background threads (v28 or earlier).
     def __init__(self):
         super().__init__()
         global BORDER, RADIUS
@@ -476,30 +612,34 @@ class App(ctk.CTk):
         self.hk_thread, self.hk_tid = None, 0
         self.active = self.maxed = None
         self.dock_local = self.last_dock = self._relayout = None
+        self.dock_fast_until, self.hires, self._td, self._winpos = 0.0, False, None, None
         self.press, self.was_down, self.app_fg_top, self._tab, self._dirty, self.dock_fix = None, False, False, "", False, 0
         # background work
         self.launch_jobs, self.launch_lock = 0, threading.Lock()
         self.afk_busy, self.afk_next = False, time.time() + 480
         self.afk_hw = self.afk_pt = None; self.afk_pressed = False
         self.sel, self.rows, self.v = {}, {}, {}
+        self.latest_ver, self.pid_build, self.out_logged = None, {}, set()     # newest Roblox build, pid -> running build, warned pids
+        self.vram, self.vram_ok, self.io_prev = {}, None, {}
         self.gpu, self.gpu_total, self.gpu_ok = {}, 0.0, None      # pid -> GPU %, system GPU %, counters available?
-        self.summary = tk.StringVar(value="")
         self.build(); self.refresh()
-        self.bind("<Configure>", self.on_resize, add="+"); self.after(1500, lambda: setattr(self, "ready", True))
+        self.bind("<Configure>", self.on_resize, add="+"); self.bind("<Configure>", self.on_move, add="+"); self.after(1500, lambda: setattr(self, "ready", True))
         for delay, fn in ((40, self.poll), (1000, self.sync), (2000, self.dash), (600, self.badge_loop),
                           (1500, self.heal_loop), (100, self.track_dock)):
             self.after(delay, fn)
-        for fn in (self.maintenance, self.watch_loop, self.gpu_loop):
+        for fn in (self.maintenance, self.watch_loop, self.gpu_loop, self.version_loop):
             threading.Thread(target=fn, daemon=True).start()
         if self.cfg["auto_update"]: self.after(4000, lambda: threading.Thread(target=self.check_update, daemon=True).start())
         if self.cfg["hotkeys"]: self.hotkeys(True)
         self.log("Better RAM started")
 
+    # Sets the window icon (drawn in code, see app_icon) (v28 or earlier).
     def set_icon(self):
         try: self.iconbitmap(app_icon())
         except Exception: pass
 
     @property
+    # True while launching or Anti-AFK is moving windows; clicks are ignored meanwhile (v28 or earlier).
     def busy(self):                                         # launching / anti-AFK moves windows: ignore clicks meanwhile
         return self.launch_jobs > 0 or self.afk_busy
 
@@ -509,20 +649,24 @@ class App(ctk.CTk):
                              fg_color=TXT if primary else BTN, hover_color="#ffffff" if primary else BTN_H,
                              text_color=BG if primary else TXT, font=("Segoe UI Semibold", 13))
 
+    # Creates a rounded settings card, optionally with a title (v28 or earlier).
     def card(self, parent, title=None):
-        c = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=18); c.pack(fill="x", padx=6, pady=8)
+        c = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=18); c.pack(fill="x", padx=3, pady=6)
         if title: ctk.CTkLabel(c, text=title, font=("Segoe UI Semibold", 15), text_color=TXT).pack(anchor="w", padx=18, pady=(14, 4))
         return c
 
+    # Creates one horizontal row inside a card (v28 or earlier).
     def line(self, parent):
-        f = ctk.CTkFrame(parent, fg_color="transparent"); f.pack(fill="x", padx=18, pady=7); return f
+        f = ctk.CTkFrame(parent, fg_color="transparent"); f.pack(fill="x", padx=14, pady=6); return f
 
+    # Adds a label + text entry bound to a config key (v28 or earlier).
     def entry(self, f, label, key, w=70):
         ctk.CTkLabel(f, text=label, text_color=MUTED).pack(side="left")
         v = tk.StringVar(value=str(self.cfg[key])); self.v[key] = v
         ctk.CTkEntry(f, textvariable=v, width=w, height=34, corner_radius=10, fg_color=FIELD,
                      border_width=0).pack(side="left", padx=(8, 22))
 
+    # Adds a checkbox bound to a config key (v28 or earlier).
     def check(self, f, label, key, cmd=None):
         v = tk.BooleanVar(value=self.cfg[key]); self.v[key] = v
         ctk.CTkCheckBox(f, text=label, variable=v, onvalue=True, offvalue=False, corner_radius=7, command=cmd,
@@ -547,6 +691,7 @@ class App(ctk.CTk):
             e = ctk.CTkEntry(card, width=400, height=38, corner_radius=10, fg_color=FIELD, border_width=0, show="•" if secret else "")
             e.insert(0, field); e.pack(padx=34, pady=(0, 18))
         out = tk.StringVar(); res = {}
+        # Button handler of the in-app prompt: stores which button (or the typed text) was chosen and closes the prompt.
         def pick(i):
             res["v"] = e.get() if e is not None and i == 0 else buttons[i][1]; out.set("x")
         row = ctk.CTkFrame(card, fg_color="transparent"); row.pack(pady=(0, 26))
@@ -566,6 +711,7 @@ class App(ctk.CTk):
         self.after(50, self.retile); self.after(150, self.verify_layout)
         return res["v"]
 
+    # In-app message box with one OK button (never a native dialog) (v28 or earlier).
     def note(self, title, text): self.confirm(title, text, [("OK", True)])
 
     def ask(self, title, prompt, secret=False, default=""):
@@ -574,10 +720,10 @@ class App(ctk.CTk):
 
     # ---------- UI ----------
     def build(self):
-        tv = self.tv = ctk.CTkTabview(self, fg_color=BG, corner_radius=18, segmented_button_fg_color=CARD,
+        tv = self.tv = ctk.CTkTabview(self, fg_color=BG, corner_radius=18, command=lambda: self.after(10, self.kick_track), segmented_button_fg_color=CARD,
                                       segmented_button_selected_color=BTN_H, segmented_button_selected_hover_color=BTN_H,
                                       segmented_button_unselected_color=CARD, segmented_button_unselected_hover_color=BTN)
-        tv.pack(fill="both", expand=True, padx=14, pady=14)
+        tv.pack(fill="both", expand=True, padx=6, pady=8)
         dash, view, sett = tv.add("Dashboard"), tv.add("Viewer"), tv.add("Settings")
 
         # --- viewer ---
@@ -611,68 +757,79 @@ class App(ctk.CTk):
         self.empty.place(relx=0.5, rely=0.5, anchor="center"); self.empty_on = True
 
         # --- dashboard: left = game + accounts, right = log, bottom = actions ---
-        dash.grid_columnconfigure(0, weight=3); dash.grid_columnconfigure(1, weight=2); dash.grid_rowconfigure(0, weight=1)
+        dash.grid_columnconfigure(0, weight=3, uniform="dash"); dash.grid_columnconfigure(1, weight=2, uniform="dash"); dash.grid_rowconfigure(0, weight=1)   # fixed 60/40, whatever the text inside
         left = ctk.CTkFrame(dash, fg_color="transparent"); left.grid(row=0, column=0, sticky="nsew")
         right = ctk.CTkFrame(dash, fg_color="transparent"); right.grid(row=0, column=1, sticky="nsew")
-        lb = ctk.CTkFrame(right, fg_color="transparent"); lb.pack(fill="x", padx=6, pady=(8, 8))
+        lb = ctk.CTkFrame(right, fg_color="transparent"); lb.pack(fill="x", padx=3, pady=(6, 6))
         self.btn(lb, "Clear", self.clear_log, w=100).pack(side="left", padx=6)
         self.btn(lb, "Open log file", lambda: os.path.exists(LOG) and os.startfile(LOG), w=140).pack(side="left", padx=6)
-        bar = ctk.CTkFrame(right, fg_color="transparent"); bar.pack(side="bottom", fill="x", padx=6, pady=(0, 4))
+        bar = ctk.CTkFrame(right, fg_color="transparent"); bar.pack(side="bottom", fill="x", padx=3, pady=(0, 2))
         self.logbox = ctk.CTkTextbox(right, fg_color=CARD, corner_radius=14, text_color=TXT,
                                      font=("Consolas", 13), wrap="word", state="disabled")
-        self.logbox.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.logbox.pack(fill="both", expand=True, padx=3, pady=(0, 6))
         for tag, col in (("ok", GREEN), ("warn", ORANGE), ("bad", RED), ("info", TXT)):
             self.logbox.tag_config(tag, foreground=col)
 
         g = self.card(left)
-        f = self.line(g)
-        self.v["place"] = tk.StringVar(value=self.cfg["place"])
-        ctk.CTkEntry(f, textvariable=self.v["place"], width=80, height=38, corner_radius=10, fg_color=FIELD, border_width=0,
-                     placeholder_text="Game ID or roblox.com/games/... link").pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.btn(f, "Save", self.save_game, w=90).pack(side="left")
-        f = self.line(g)
-        ctk.CTkLabel(f, text="Saved games", text_color=MUTED, width=90, anchor="w").pack(side="left")
-        self.combo = ctk.CTkComboBox(f, values=[""], width=80, height=38, corner_radius=10, fg_color=FIELD,
-                                     border_width=0, button_color=BTN, button_hover_color=BTN_H,
-                                     dropdown_fg_color=CARD, state="readonly", command=self.pick_game)
-        self.combo.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        ctk.CTkButton(f, text="Delete", command=self.del_game, width=90, height=38, corner_radius=12,
-                      fg_color="#4a1d24", hover_color="#6b2833", text_color="#ff9a9a",
-                      font=("Segoe UI Semibold", 13)).pack(side="left")
-        # what the accounts will actually join (always the ID in the field above)
-        self.join_box = ctk.CTkFrame(g, fg_color=FIELD, corner_radius=12); self.join_box.pack(fill="x", padx=18, pady=(2, 14))
-        self.join_dot = ctk.CTkLabel(self.join_box, text="●", text_color=MUTED, font=("Segoe UI", 16), width=24)
-        self.join_dot.pack(side="left", padx=(12, 2), pady=10)
+        f = ctk.CTkFrame(g, fg_color="transparent"); f.pack(fill="x", padx=12, pady=(10, 4)); f.grid_columnconfigure(1, weight=1)
+        self.v["place"] = tk.StringVar(value=self.cfg["place"]); self.v["join_user"] = tk.StringVar(value=self.cfg["join_user"])
+        self.mode_btn = ctk.CTkSegmentedButton(f, values=["Game", "User"], command=self.set_join_mode, width=110, height=34,
+                                               corner_radius=10, fg_color=FIELD, selected_color=BTN_H, selected_hover_color=BTN_H,
+                                               unselected_color=FIELD, unselected_hover_color=BTN, text_color=TXT,
+                                               font=("Segoe UI Semibold", 13))
+        self.mode_btn.set("User" if self.cfg["join_mode"] == "user" else "Game"); self.mode_btn.grid(row=0, column=0, padx=(0, 6))
+        self.e_game = ctk.CTkEntry(f, textvariable=self.v["place"], height=34, corner_radius=10, fg_color=FIELD, border_width=0,
+                                   placeholder_text="Game ID or roblox.com/games/... link")
+        self.e_user = ctk.CTkEntry(f, textvariable=self.v["join_user"], height=34, corner_radius=10, fg_color=FIELD, border_width=0,
+                                   placeholder_text="Roblox username to join")
+        self.e_game.grid(row=0, column=1, sticky="ew", padx=(0, 6)); self.e_user.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        self.btn(f, "Save", self.save_target, w=60, h=34).grid(row=0, column=2, padx=(0, 6))
+        self.combo = ctk.CTkComboBox(f, values=[""], width=150, height=34, corner_radius=10, fg_color=FIELD, border_width=0,
+                                     button_color=BTN, button_hover_color=BTN_H, dropdown_fg_color=CARD, state="readonly",
+                                     command=self.pick_target)
+        self.combo.grid(row=0, column=3, padx=(0, 6))
+        ctk.CTkButton(f, text="Delete", command=self.del_target, width=64, height=34, corner_radius=12, fg_color="#4a1d24",
+                      hover_color="#6b2833", text_color="#ff9a9a", font=("Segoe UI Semibold", 13)).grid(row=0, column=4)
+        self.join_box = ctk.CTkFrame(g, fg_color=FIELD, corner_radius=10); self.join_box.pack(fill="x", padx=12, pady=(2, 10))
+        self.join_dot = ctk.CTkLabel(self.join_box, text="●", text_color=MUTED, font=("Segoe UI", 14), width=20)
+        self.join_dot.pack(side="left", padx=(10, 2), pady=4)
         self.join_lbl = ctk.CTkLabel(self.join_box, text="", anchor="w", justify="left", text_color=TXT,
-                                     font=("Segoe UI Semibold", 13), wraplength=520)
-        self.join_lbl.pack(side="left", fill="x", expand=True, padx=(2, 12), pady=10)
-        self.v["place"].trace_add("write", lambda *_: self.after_idle(self.update_game_info))
+                                     font=("Segoe UI Semibold", 12), wraplength=480)
+        self.join_lbl.pack(side="left", fill="x", expand=True, padx=(2, 10), pady=4)
+        for k in ("place", "join_user"): self.v[k].trace_add("write", lambda *_: self.after_idle(self.update_game_info))
         self.refresh_games()
 
         # --- dashboard: summary, accounts, actions ---
-        s = ctk.CTkFrame(left, fg_color=CARD, corner_radius=14); s.pack(fill="x", padx=6, pady=(4, 6))
-        ctk.CTkLabel(s, textvariable=self.summary, font=("Segoe UI Semibold", 14), text_color=TXT,
-                     anchor="w").pack(fill="x", padx=18, pady=12)
-        hd = ctk.CTkFrame(left, fg_color="transparent"); hd.pack(fill="x", padx=6, pady=(2, 0))
+        s = ctk.CTkFrame(left, fg_color=CARD, corner_radius=14); s.pack(fill="x", padx=3, pady=(4, 6))
+        self.sum = {}                                        # fixed-width cells: a changing number can never resize the layout
+        for i, (k, w) in enumerate((("run", 74), ("frozen", 70), ("disc", 112), ("crashed", 80), ("ram", 92), ("cpu", 66), ("gpu", 70))):
+            self.sum[k] = ctk.CTkLabel(s, text="", font=("Segoe UI Semibold", 13), text_color=TXT, anchor="w", width=w)
+            self.sum[k].pack(side="left", padx=(14 if i == 0 else 4, 0), pady=12)
+        hd = ctk.CTkFrame(left, fg_color="transparent"); hd.pack(fill="x", padx=3, pady=(2, 0))
         self.btn(hd, "Select all", self.sel_all, w=110, h=30).pack(side="left", padx=6)
         self.btn(hd, "Deselect all", self.sel_none, w=120, h=30).pack(side="left", padx=6)
         self.btn(hd, "Refresh status", self.refresh_status, w=130, h=30).pack(side="right", padx=6)
+        self.rc_btn = self.btn(hd, "Roll call", self.toggle_compact, w=96, h=30); self.rc_btn.pack(side="right", padx=0)
+        self.perf_btn = self.btn(hd, "Performance", self.toggle_perf, w=110, h=30); self.perf_btn.place(relx=0.5, rely=0.5, anchor="center")
+        self.style_roll_btn()
         self.list = ctk.CTkScrollableFrame(left, fg_color=CARD, corner_radius=18, height=120)
-        self.list.pack(fill="both", expand=True, padx=6, pady=6)
+        self.list.pack(fill="both", expand=True, padx=3, pady=(6, 3))
         bar.grid_columnconfigure((0, 1), weight=1)
         ctk.CTkButton(bar, text="Launch selected", command=self.launch, height=40, corner_radius=12,
                       fg_color=TXT, hover_color="#ffffff", text_color=BG,
-                      font=("Segoe UI Semibold", 15)).grid(row=0, column=0, columnspan=2, padx=4, pady=(4, 6), sticky="ew")
+                      font=("Segoe UI Semibold", 15)).grid(row=0, column=0, columnspan=2, padx=2, pady=(4, 6), sticky="ew")
         grid = ((("Rejoin selected", self.rejoin_selected), ("Close selected", self.close_selected)),
                 (("Add account (paste cookie)", self.add), ("Add account via browser", self.add_browser)),
                 (("Export accounts", self.export_accounts), ("Import accounts", self.import_accounts)),
                 (("Close all", self.close_all), None))
         for r, items in enumerate(grid, 1):
             for c, it in enumerate(items):
-                if it: self.btn(bar, it[0], it[1], h=32).grid(row=r, column=c, padx=4, pady=3, sticky="ew")
+                if it:
+                    b = self.btn(bar, it[0], it[1], h=32); b.configure(font=("Segoe UI Semibold", 12))
+                    b.grid(row=r, column=c, padx=2, pady=3, sticky="ew")
         ctk.CTkButton(bar, text="Delete selected accounts", command=self.remove, height=32, corner_radius=12,
                       fg_color="#4a1d24", hover_color="#6b2833", text_color="#ff9a9a",
-                      font=("Segoe UI Semibold", 13)).grid(row=4, column=1, padx=4, pady=3, sticky="ew")
+                      font=("Segoe UI Semibold", 12)).grid(row=4, column=1, padx=2, pady=3, sticky="ew")
 
         # --- settings ---
         sc = ctk.CTkScrollableFrame(sett, fg_color=BG); sc.pack(fill="both", expand=True)
@@ -680,8 +837,10 @@ class App(ctk.CTk):
         f = self.line(c); self.entry(f, "Launch delay (s)", "delay", 60)
         f = self.line(c); self.entry(f, "Tile area % of viewer width", "pane", 60)
         self.btn(f, "Apply", lambda: self.apply_layout(pane=True), w=90, h=34).pack(side="left")
+        ctk.CTkLabel(f, text="Limits: 20-70 %, used with 2+ instances (one instance fills the viewer)", text_color=MUTED).pack(side="left", padx=12)
         f = self.line(c); self.check(f, "Custom tile size (unfocused window)", "micro")
         self.entry(f, "Width px", "windowWidth", 60); self.entry(f, "Height px", "windowHeight", 60)
+        ctk.CTkLabel(f, text="Limits: 40-4000 px", text_color=MUTED).pack(side="left")
         f = self.line(c)
         ctk.CTkLabel(f, text="Presets", text_color=MUTED).pack(side="left")
         ctk.CTkOptionMenu(f, values=["320x240", "240x180", "200x150", "160x120", "120x90"], width=120, height=34,
@@ -731,21 +890,25 @@ class App(ctk.CTk):
         except Exception: pass
         self.after(0, lambda: self.log_line(stamp, msg, kind))
 
+    # Writes one timestamped line into the log panel; called on the main thread (added v33, split out of log).
     def log_line(self, stamp, msg, kind):
         self.logbox.configure(state="normal")
         self.logbox.insert("end", f"{stamp}  {msg}\n", kind)
         if int(self.logbox.index("end-1c").split(".")[0]) > 1500: self.logbox.delete("1.0", "300.0")
         self.logbox.configure(state="disabled"); self.logbox.see("end")
 
+    # Short hint such as 'tick accounts first': shown in the log panel only, not saved to the log file (v28; reworked v33).
     def say(self, text):                                    # short hint ("tick accounts first"): shown in the log panel only
         stamp = time.strftime("%H:%M:%S"); self.after(0, lambda: self.log_line(stamp, text, "warn"))
 
+    # Empties the log panel (the log file is untouched) (v28 or earlier).
     def clear_log(self):
         self.logbox.configure(state="normal"); self.logbox.delete("1.0", "end"); self.logbox.configure(state="disabled")
 
     # ---------- config ----------
     PENDING = {"micro", "windowWidth", "windowHeight", "pane"}      # committed by apply_layout only
 
+    # Copies every settings widget value into self.cfg; entries in PENDING are only committed by apply_layout (v28 or earlier).
     def collect(self):
         for k, var in self.v.items():
             if k in self.PENDING: continue
@@ -757,6 +920,7 @@ class App(ctk.CTk):
                 m = re.search(r"\d+", str(val))
                 if m: self.cfg[k] = int(m.group())
 
+    # Writes self.cfg to the data file when something changed (v28 or earlier).
     def save(self):
         self.collect()
         try:
@@ -766,36 +930,68 @@ class App(ctk.CTk):
                 self._saved = blob
         except Exception: pass
 
+    # Saves settings about once a second so every change is persisted (v28 or earlier).
     def sync(self):                                         # every setting change is persisted within a second
         self.save(); self.after(1000, self.sync)
 
     # ---------- games ----------
     def glabels(self): return [f'{g["name"]}  ({g["place"]})' for g in self.cfg["games"]]
 
+    # Returns the saved game that has this place id, or None (added v29).
     def game_for(self, pid): return next((g for g in self.cfg["games"] if g["place"] == pid), None)
 
+    # True when the Game | User switch is on 'User' (accounts follow a user instead of joining a game) (added v37).
+    def user_mode(self): return self.cfg.get("join_mode") == "user"
+
+    # Handler of the Game | User switch: stores the mode and reloads the saved menu (added v37).
+    def set_join_mode(self, v):
+        self.cfg["join_mode"] = "user" if v == "User" else "game"; self.save(); self.refresh_games()
+
+    # Refreshes the 'Accounts will join' line and the saved menu to match the entry (added v29; user mode added v37).
     def update_game_info(self):
-        """Shows exactly which game the accounts will join: the ID in the field. Green = saved game, orange = not saved."""
         try:
-            pid = parse_place(self.v["place"].get()); g = self.game_for(pid) if pid else None
-            if not pid: dot, col, txt = MUTED, MUTED, "No game selected - enter a game ID or link above"
-            elif g: dot, col, txt = GREEN, TXT, f'Accounts will join:  {g["name"]}  (ID {pid})   -   saved'
-            else: dot, col, txt = ORANGE, TXT, f"Accounts will join:  ID {pid}   -   not saved yet (press Save to name it)"
-            self.join_dot.configure(text_color=dot); self.join_lbl.configure(text=txt, text_color=col)
-            lab = f'{g["name"]}  ({g["place"]})' if g else ""
-            if self.combo.get() != lab: self.combo.set(lab)           # menu always shows the saved game that is in use
+            if self.user_mode():
+                self.e_game.grid_remove(); self.e_user.grid()
+                who = self.v["join_user"].get().strip().lstrip("@"); saved = who.lower() in [u.lower() for u in self.cfg["users"]]
+                if not who: dot, txt = MUTED, "No user selected - type a Roblox username above"
+                elif not USER_RE.match(who): dot, txt = RED, f'"{who}" is not a valid Roblox username'
+                elif saved: dot, txt = GREEN, f"Accounts will join:  {who}'s server (looked up at launch)   -   saved"
+                else: dot, txt = ORANGE, f"Accounts will join:  {who}'s server (looked up at launch)   -   not saved yet"
+                lab = next((u for u in self.cfg["users"] if u.lower() == who.lower()), "")
+            else:
+                self.e_user.grid_remove(); self.e_game.grid()
+                pid = parse_place(self.v["place"].get()); g = self.game_for(pid) if pid else None
+                if not pid: dot, txt = MUTED, "No game selected - enter a game ID or link above"
+                elif g: dot, txt = GREEN, f'Accounts will join:  {g["name"]}  (ID {pid})   -   saved'
+                else: dot, txt = ORANGE, f"Accounts will join:  ID {pid}   -   not saved yet (press Save to name it)"
+                lab = f'{g["name"]}  ({g["place"]})' if g else ""
+            self.join_dot.configure(text_color=dot); self.join_lbl.configure(text=txt)
+            if self.combo.get() != lab: self.combo.set(lab)
         except Exception: pass
 
+    # Reloads the saved menu with saved games or saved users, depending on the mode (v28; reworked v37).
     def refresh_games(self):
-        self.combo.configure(values=self.glabels() or [""]); self.update_game_info()
+        vals = self.cfg["users"] if self.user_mode() else self.glabels()
+        self.combo.configure(values=vals or [""]); self.update_game_info()
 
-    def pick_game(self, choice):
-        L = self.glabels()
-        if choice in L: self.v["place"].set(self.cfg["games"][L.index(choice)]["place"])
+    # Handler of the saved menu: copies the chosen game id or username into the entry (added v37, replaces pick_game).
+    def pick_target(self, choice):
+        if self.user_mode():
+            if choice in self.cfg["users"]: self.v["join_user"].set(choice)
+        else:
+            L = self.glabels()
+            if choice in L: self.v["place"].set(self.cfg["games"][L.index(choice)]["place"])
         self.update_game_info()
 
-    def save_game(self):
-        self.collect(); pid = parse_place(self.cfg["place"])
+    # Save button: saves the typed game (asks for a name) or the typed username (added v37, replaces save_game).
+    def save_target(self):
+        self.collect()
+        if self.user_mode():
+            who = self.cfg["join_user"].lstrip("@")
+            if not USER_RE.match(who): return self.note("Join user", "Type a valid Roblox username first (3-20 letters, numbers or _).")
+            if who.lower() not in [u.lower() for u in self.cfg["users"]]: self.cfg["users"].append(who)
+            self.v["join_user"].set(who); self.save(); return self.refresh_games()
+        pid = parse_place(self.cfg["place"])
         if not pid: return self.note("Game", "Paste a game ID or link first.")
         old = self.game_for(pid)
         name = self.ask("Save game", "Name for this game:", default=old["name"] if old else "")
@@ -803,9 +999,17 @@ class App(ctk.CTk):
         self.cfg["games"] = [g for g in self.cfg["games"] if g["place"] != pid] + [{"name": name, "place": pid}]
         self.v["place"].set(pid); self.refresh_games()
 
-    def del_game(self):
-        L = self.glabels(); cur = self.combo.get()
-        if cur not in L: return self.say("No saved game selected - pick one in the Saved games menu first")
+    # Delete button: asks for confirmation, then removes the selected saved game or user (added v37, replaces del_game).
+    def del_target(self):
+        cur = self.combo.get()
+        if self.user_mode():
+            if cur not in self.cfg["users"]: return self.say("No saved user selected - pick one in the menu first")
+            if not self.confirm("Delete user", f'Delete the saved user "{cur}" from Better RAM?\n\nIt is only removed from your saved '
+                                "users list. Nothing changes on Roblox or on your accounts.", [("Delete", True), ("Cancel", False)]): return
+            self.cfg["users"] = [u for u in self.cfg["users"] if u != cur]; self.save()
+            self.refresh_games(); return self.log(f'Deleted saved user "{cur}"')
+        L = self.glabels()
+        if cur not in L: return self.say("No saved game selected - pick one in the menu first")
         g = self.cfg["games"][L.index(cur)]
         if not self.confirm("Delete game", f'Delete the saved game "{g["name"]}" (ID {g["place"]}) from Better RAM?\n\n'
                             "It is removed from your saved games list and you would have to save it again. "
@@ -815,50 +1019,110 @@ class App(ctk.CTk):
 
     # ---------- accounts ----------
     def account(self, name): return next((a for a in self.cfg["accounts"] if a["name"] == name), None)
+    # Names of the accounts whose checkbox is ticked (v28 or earlier).
     def checked(self): return [n for n, v in self.sel.items() if v.get()]
+    # Ticks every account (v28 or earlier).
     def sel_all(self): [v.set(True) for v in self.sel.values()]
+    # Unticks every account (v28 or earlier).
     def sel_none(self): [v.set(False) for v in self.sel.values()]
 
+    # Roll call button: switches the account list to the compact [name - status] view and back (added v36).
+    def toggle_compact(self):
+        self.cfg["compact"] = not self.cfg.get("compact", False)
+        if self.cfg["compact"]: self.cfg["perf"] = False
+        self.style_roll_btn(); self.save(); self.build_rows(); self.update_rows()
+
+    # Performance button: switches the account list to the performance table and back (added v37).
+    def toggle_perf(self):
+        self.cfg["perf"] = not self.cfg.get("perf", False)
+        if self.cfg["perf"]: self.cfg["compact"] = False
+        self.style_roll_btn(); self.save(); self.build_rows(); self.update_rows()
+
+    # Lights up the Roll call / Performance buttons while their view is active (added v36).
+    def style_roll_btn(self):
+        for btn, key in ((self.rc_btn, "compact"), (self.perf_btn, "perf")):
+            on = self.cfg.get(key, False)
+            btn.configure(fg_color=TXT if on else BTN, hover_color="#ffffff" if on else BTN_H, text_color=BG if on else TXT)
+
+    # Rebuilds the account rows and the Viewer AFK list from the saved accounts (v28; split into build_rows in v36).
     def refresh(self):
+        self.build_rows(); self.build_afk_list([a["name"] for a in self.cfg["accounts"]]); self.after(50, self.update_rows)
+
+    # Creates the account rows in one of three views: normal, Roll call (compact) or Performance (added v36; Performance v37).
+    def build_rows(self):
         for w in self.list.winfo_children(): w.destroy()
         self.rows = {}
         names = [a["name"] for a in self.cfg["accounts"]]
         self.sel = {n: self.sel.get(n, tk.BooleanVar(value=False)) for n in names}
+        compact = self.cfg.get("compact", False) and not self.cfg.get("perf", False)
+        perf = self.cfg.get("perf", False)
+        for c in range(3): self.list.grid_columnconfigure(c, weight=1 if compact else 0, uniform="rc" if compact else "")
         for i, n in enumerate(names):
-            if i: ctk.CTkFrame(self.list, height=2, corner_radius=0, fg_color=BTN_H).pack(fill="x", padx=18, pady=2)
-            f = ctk.CTkFrame(self.list, fg_color=FIELD, corner_radius=14); f.pack(fill="x", pady=3, padx=4)
+            bad = self.cookie_ok.get(n) is False
+            txt, col = ("Cookie expired - re-login", RED) if bad else ("Idle", MUTED)
+            if perf:
+                if i == 0:
+                    hf = ctk.CTkFrame(self.list, fg_color="transparent"); hf.pack(fill="x", pady=(0, 2), padx=2)
+                    for col_i, (t, w, an) in enumerate(PERF_COLS):
+                        ctk.CTkLabel(hf, text=t, text_color=MUTED, width=w, anchor=an, font=("Segoe UI", 11)).grid(row=0, column=col_i, padx=PERF_PAD)
+                f = ctk.CTkFrame(self.list, fg_color=FIELD, corner_radius=12); f.pack(fill="x", pady=2, padx=2)
+                r = {"perf": True}
+                r["dot"] = ctk.CTkLabel(f, text="●", text_color=col, width=PERF_COLS[0][1], font=("Segoe UI", 12))
+                r["dot"].grid(row=0, column=0, padx=PERF_PAD, pady=7)
+                ctk.CTkCheckBox(f, text=n, variable=self.sel[n], onvalue=True, offvalue=False, corner_radius=6, checkbox_width=20,
+                                checkbox_height=20, fg_color=TXT, hover_color="#ffffff", checkmark_color=BG, border_color=BTN_H,
+                                text_color=TXT, font=("Segoe UI", 12), width=PERF_COLS[1][1]).grid(row=0, column=1, padx=PERF_PAD, sticky="w")
+                for col_i, key in enumerate(("cpu", "gpu", "vram", "ram", "rd", "wr"), 2):
+                    r[key] = ctk.CTkLabel(f, text="", text_color=TXT, width=PERF_COLS[col_i][1], anchor="e", font=("Segoe UI", 12))
+                    r[key].grid(row=0, column=col_i, padx=PERF_PAD)
+                r["st"] = None; self.rows[n] = r
+                continue
+            if compact:                                      # roll call: [username - status], 3 per row
+                f = ctk.CTkFrame(self.list, fg_color=FIELD, corner_radius=10)
+                f.grid(row=i // 3, column=i % 3, padx=3, pady=3, sticky="ew"); f.grid_columnconfigure(0, weight=1)
+                ctk.CTkCheckBox(f, text=n, variable=self.sel[n], onvalue=True, offvalue=False, corner_radius=6,
+                                checkbox_width=20, checkbox_height=20, fg_color=TXT, hover_color="#ffffff", checkmark_color=BG,
+                                border_color=BTN_H, text_color=TXT, font=("Segoe UI", 12), width=100).grid(row=0, column=0, padx=(8, 2), pady=8, sticky="w")
+                st = ctk.CTkLabel(f, text="", text_color=col, anchor="e", width=58, font=("Segoe UI Semibold", 12))
+                st.grid(row=0, column=1, padx=(0, 8))
+                self.rows[n] = {"st": st, "short": True}; put(self.rows[n], "st", txt, col)
+                continue
+            if i: ctk.CTkFrame(self.list, height=2, corner_radius=0, fg_color=BTN_H).pack(fill="x", padx=14, pady=2)
+            f = ctk.CTkFrame(self.list, fg_color=FIELD, corner_radius=14); f.pack(fill="x", pady=3, padx=2)
             f.grid_columnconfigure(1, weight=1)
             ctk.CTkCheckBox(f, text=n, variable=self.sel[n], onvalue=True, offvalue=False, corner_radius=7,
                             fg_color=TXT, hover_color="#ffffff", checkmark_color=BG, border_color=BTN_H,
-                            text_color=TXT, width=140).grid(row=0, column=0, padx=(10, 6), pady=10, sticky="w")
-            bad = self.cookie_ok.get(n) is False
-            st = ctk.CTkLabel(f, text="Cookie expired - re-login" if bad else "Idle",
-                              text_color=RED if bad else MUTED, anchor="w", width=100)
+                            text_color=TXT, width=140).grid(row=0, column=0, padx=(10, 4), pady=8, sticky="w")
+            sf = ctk.CTkFrame(f, fg_color="transparent"); sf.grid(row=0, column=1, padx=4, sticky="w")
+            st = ctk.CTkLabel(sf, text=txt, text_color=col, anchor="w", width=100); st.pack(anchor="w")
+            tm = ctk.CTkLabel(sf, text="", text_color=MUTED, anchor="w", width=100, height=14, font=("Segoe UI", 11)); tm.pack(anchor="w")
             cpu = ctk.CTkLabel(f, text="", text_color=MUTED, width=40)
             ram = ctk.CTkLabel(f, text="", text_color=MUTED, width=62)
             gpu = ctk.CTkLabel(f, text="", text_color=MUTED, width=64)
-            st.grid(row=0, column=1, padx=6, sticky="w"); cpu.grid(row=0, column=2, padx=4); ram.grid(row=0, column=3, padx=4)
-            gpu.grid(row=0, column=4, padx=4)
+            cpu.grid(row=0, column=2, padx=3); ram.grid(row=0, column=3, padx=3); gpu.grid(row=0, column=4, padx=3)
             lp = tk.BooleanVar(value=n in self.cfg["idle_prio"])
             ctk.CTkCheckBox(f, text="Low prio", variable=lp, command=lambda n=n, v=lp: self.set_idle_prio(n, v.get()),
                             width=70, checkbox_width=18, checkbox_height=18, corner_radius=5, fg_color=TXT,
                             hover_color="#ffffff", checkmark_color=BG, border_color=BTN_H, text_color=MUTED,
-                            font=("Segoe UI", 12)).grid(row=0, column=5, padx=(6, 2))
-            self.btn(f, "Show", lambda n=n: self.show(n), w=52, h=32).grid(row=0, column=6, padx=(4, 10))
-            self.rows[n] = {"st": st, "cpu": cpu, "ram": ram, "gpu": gpu}
-        self.build_afk_list(names); self.after(50, self.update_rows)
+                            font=("Segoe UI", 12)).grid(row=0, column=5, padx=(4, 2))
+            self.btn(f, "Show", lambda n=n: self.show(n), w=52, h=32).grid(row=0, column=6, padx=(4, 8))
+            self.rows[n] = {"st": st, "tm": tm, "cpu": cpu, "ram": ram, "gpu": gpu}
 
+    # Sets an account's status text from any thread (v28 or earlier).
     def set_status(self, name, text, color=MUTED):
+        # Runs on the main thread: writes the status text into the row.
         def go():
             r = self.rows.get(name)
             if r: put(r, "st", text, color)
         self.after(0, go)
 
+    # Creates one Anti-AFK checkbox for an account (v28 or earlier).
     def afk_box(self, parent, n):
         return ctk.CTkCheckBox(parent, text=n, variable=self.afk_sel[n], command=self.afk_toggle, width=20,
                                height=20, checkbox_width=18, checkbox_height=18, corner_radius=5, fg_color=TXT, hover_color="#ffffff",
                                checkmark_color=BG, border_color=BTN_H, text_color=TXT, font=("Segoe UI", 12))
 
+    # Rebuilds the Viewer's Anti-AFK account list (v28; grid of columns with an auto scrollbar since v32).
     def build_afk_list(self, names):
         for w in self.afk_list.winfo_children(): w.destroy()
         skip = set(self.cfg["afk_skip"])
@@ -892,23 +1156,28 @@ class App(ctk.CTk):
                 else: sb.grid_remove(); self.afk_list._parent_canvas.yview_moveto(0)
         except Exception: pass
 
+    # All / None buttons of the Anti-AFK list (v28 or earlier).
     def afk_all(self, on):
         for v in self.afk_sel.values(): v.set(on)
         self.afk_toggle()
 
+    # Stores which accounts are skipped by Anti-AFK and updates the counter (v28 or earlier).
     def afk_toggle(self):
         self.cfg["afk_skip"] = [n for n, v in self.afk_sel.items() if not v.get()]
         self.afk_count()
 
+    # Updates the 'AFK on (x/y)' label (v28 or earlier).
     def afk_count(self):
         t = f"AFK on ({sum(v.get() for v in self.afk_sel.values())}/{len(self.afk_sel)}):"
         if self.afk_label.cget("text") != t: self.afk_label.configure(text=t)
 
+    # Saves a new account (cookie encrypted) and refreshes the list (v28 or earlier).
     def store_account(self, name, cookie, uid):
         self.cfg["accounts"] = [a for a in self.cfg["accounts"] if a["name"] != name] + \
                                [{"name": name, "cookie": enc(cookie), "id": uid}]
         self.cookie_ok.pop(name, None); self.refresh(); self.log(f"Added account {name}", "ok")
 
+    # 'Add account (paste cookie)': asks for the .ROBLOSECURITY cookie and checks it with Roblox (v28 or earlier).
     def add(self):
         c = self.ask("Add account", "Paste the .ROBLOSECURITY cookie\n(treat it like a password):", secret=True)
         if not c: return
@@ -916,10 +1185,12 @@ class App(ctk.CTk):
         except Exception as ex: return self.note("Invalid cookie", str(ex))
         self.store_account(name, c.strip(), uid)
 
+    # 'Add account via browser': opens a browser login in a background thread (v28 or earlier).
     def add_browser(self):
         self.log("Opening browser - log in there (2FA/captcha work normally). It closes by itself.")
         threading.Thread(target=self._browser_login, daemon=True).start()
 
+    # Runs the Playwright browser login and captures the cookie once the user is logged in (v28 or earlier).
     def _browser_login(self):
         try: from playwright.sync_api import sync_playwright
         except ImportError:
@@ -957,6 +1228,7 @@ class App(ctk.CTk):
         if found: self.after(0, lambda: self.store_account(*found))
         else: self.log("Browser login cancelled / timed out", "warn")
 
+    # Writes the accounts (cookies UNENCRYPTED) to a file after a warning (v28 or earlier).
     def export_accounts(self):
         if not self.cfg["accounts"]: return self.note("Export accounts", "There are no accounts to export.")
         if not self.confirm("Export accounts", "The file will contain your cookies UNENCRYPTED. Anyone who gets it "
@@ -975,6 +1247,7 @@ class App(ctk.CTk):
         self.log(f"Exported {len(rows)} account(s) to the Desktop", "ok")
         self.note("Export done", f"Saved to:\n{path}\n\nIt is NOT encrypted - delete it when you no longer need it.")
 
+    # Reads an export file; accounts with the same name are replaced (v28 or earlier).
     def import_accounts(self):
         d = os.path.join(desktop(), "AltManager_export.json")
         p = self.ask("Import accounts", "Path of a Better RAM export file (.json).\nAccounts with the same name are replaced.",
@@ -991,6 +1264,7 @@ class App(ctk.CTk):
         for n in names: self.cookie_ok.pop(n, None)
         self.refresh(); self.log(f"Imported {len(new)} account(s)", "ok")
 
+    # 'Delete selected accounts': in-app confirmation, then removes the saved logins (v28 or earlier).
     def remove(self):
         names = self.checked()
         if not names: return self.say("Tick the accounts you want to delete first")
@@ -1009,26 +1283,51 @@ class App(ctk.CTk):
             self.log(f"Graphics lock written (FPS {self.cfg['fps']}, quality {self.cfg['quality']}), file is read-only")
         except Exception as ex: self.note("Settings", str(ex))
 
+    # Unlocks the Roblox settings file from the Settings tab (v28 or earlier).
     def unlock(self):
         try: unlock_settings(); self.log("Graphics settings file unlocked")
         except Exception as ex: self.note("Settings", str(ex))
 
     # ---------- launching / closing / rejoining ----------
     def launch(self):
-        self.save(); place = parse_place(self.cfg["place"])
-        if not place: return self.note("Game", "Enter a game ID or roblox.com/games link.")
+        self.save(); user = self.user_mode(); place = "" if user else parse_place(self.cfg["place"])
+        who = self.cfg["join_user"].lstrip("@")
+        if user and not USER_RE.match(who): return self.note("Join user", "Type a valid Roblox username first (3-20 letters, numbers or _).")
+        if not user and not place: return self.note("Game", "Enter a game ID or roblox.com/games link.")
         if self.cfg["gfx"]: self.apply_gfx()
         sel = [a for a in self.cfg["accounts"] if a["name"] in self.checked()]
         todo = [a for a in sel if not (self.windows.get(a["name"]) in self.live() or a["name"] in self.launching)]
         if len(todo) < len(sel):
             self.log("Already running or starting, skipped: " + ", ".join(a["name"] for a in sel if a not in todo), "warn")
+        if user:
+            if todo:
+                self.launching.update(a["name"] for a in todo)
+                threading.Thread(target=self._launch_user, args=(who, todo), daemon=True).start()
+            return
         if todo: gm = self.game_for(place); self.log(f"Launching {len(todo)} account(s) into " + (f'{gm["name"]} (place {place})' if gm else f"place {place}"))
         self.start_launch(todo, place, "")
 
+    # Worker thread for User mode: looks up the user's current server, shows an error if joining isn't possible, otherwise launches every account there (added v37).
+    def _launch_user(self, who, todo):
+        cookies = []
+        for a in todo:
+            try:
+                if self.cookie_ok.get(a["name"]) is not False: cookies.append(dec(a["cookie"]))
+            except Exception: pass
+        place, job, shown, err = resolve_user(who, cookies)
+        if err:
+            for a in todo: self.launching.discard(a["name"])
+            self.log(f"Can't join {shown}: {err}", "bad")
+            return self.after(0, lambda: self.note("Can't join user", err))
+        self.log(f"Launching {len(todo)} account(s) into {shown}'s server (place {place})")
+        self.after(0, lambda: self.start_launch(todo, place, job))
+
+    # Marks accounts as launching and starts the launch worker thread (v28 or earlier).
     def start_launch(self, accounts, place, job):
         self.launching.update(a["name"] for a in accounts)
         if accounts: threading.Thread(target=self._launch_worker, args=(accounts, place, job), daemon=True).start()
 
+    # Launches accounts one after another (one Roblox start at a time) and reports errors per account (v28 or earlier).
     def _launch_worker(self, accounts, place, job):
         self.launch_jobs += 1
         try:
@@ -1048,6 +1347,7 @@ class App(ctk.CTk):
         finally:
             self.launch_jobs -= 1
 
+    # Launches a single account: ticket, start Roblox, wait for its window, hand it to the viewer (v28 or earlier).
     def launch_one(self, a, place, job):
         n = a["name"]; self.crashed.pop(n, None)
         if self.cookie_ok.get(n) is False:
@@ -1095,6 +1395,7 @@ class App(ctk.CTk):
         for ms in (8000, 20000, 40000):                      # after the game finished joining: refresh a tile stuck on old frames
             self.after(ms, lambda h=hw: self.nudge(h))
 
+    # Closes one instance and clears its row (v28; uses clear_row since v37).
     def kill_instance(self, n, status="Closed"):
         hw = self.windows.pop(n, None)
         if hw:
@@ -1105,20 +1406,23 @@ class App(ctk.CTk):
         self.disconnected.discard(n)
         r = self.rows.get(n)
         if r:
-            put(r, "st", status, MUTED); put(r, "cpu", ""); put(r, "ram", ""); put(r, "gpu", "")
+            self.clear_row(r, status, MUTED)
 
+    # Closes the ticked running accounts (v28 or earlier).
     def close_selected(self):
         names = [n for n in self.checked() if n in self.windows]
         if not names: return self.say("Tick the running accounts you want to close first")
         for n in names: self.kill_instance(n)
         self.retile(); self.log(f"Closed {len(names)} instance(s): {', '.join(names)}")
 
+    # Closes every instance (v28 or earlier).
     def close_all(self):
         names = list(self.windows)
         for n in names: self.kill_instance(n)
         self.crashed.clear(); self.active = None; self.refresh(); self.sync_empty()
         if names: self.log(f"Closed all instances ({len(names)})")
 
+    # Rejoins the ticked accounts (v28 or earlier).
     def rejoin_selected(self):
         names = self.checked()
         if not names: return self.say("Tick the accounts you want to rejoin first")
@@ -1147,6 +1451,7 @@ class App(ctk.CTk):
             self.after(0, lambda n=n, k=kind: self.on_presence(n, k))
             time.sleep(1)
 
+    # Background thread: connection watch, every 'watch_sec' seconds (minimum 30) checks whether each open account is still in a game (v28 or earlier).
     def watch_loop(self):
         nxt = time.time() + 60
         while True:
@@ -1158,6 +1463,7 @@ class App(ctk.CTk):
             except Exception as ex:
                 self.log(f"Connection watch error: {str(ex)[:70]}", "warn")
 
+    # Reacts to a presence result: tracks disconnects and triggers auto-rejoin (v28 or earlier).
     def on_presence(self, n, kind):
         if n not in self.windows: return
         if kind == 2:                                        # in a game
@@ -1171,6 +1477,7 @@ class App(ctk.CTk):
             self.log(f"{n}: DISCONNECTED - window is open but Roblox says the account is not in a game", "bad")
             if self.cfg["auto_rejoin"]: self.auto_rejoin(n)
 
+    # Rejoins a disconnected account, at most 3 attempts per 30 minutes (v28 or earlier).
     def auto_rejoin(self, n):
         now = time.time(); hist = [t for t in self.rejoin_hist.get(n, []) if now - t < 1800]
         if len(hist) >= 3: return self.log(f"{n}: auto-rejoin paused (3 attempts in 30 min)", "warn")
@@ -1190,6 +1497,7 @@ class App(ctk.CTk):
         if on: self.empty.place(relx=0.5, rely=0.5, anchor="center")
         else: self.empty.place_forget()
 
+    # Windows that still exist; also clears active/maximized when their window is gone (v28 or earlier).
     def live(self):
         wins = [h for h in self.windows.values() if user32.IsWindow(h)]
         if self.active not in wins: self.active = None
@@ -1216,6 +1524,7 @@ class App(ctk.CTk):
             fr = (0, 0, W, H)
         return slots, fr, fits
 
+    # Re-arranges every tile and the focused window in the Viewer; the central layout routine (v28 or earlier).
     def retile(self):
         order = self.cfg["view_order"]
         self.windows = dict(sorted(self.windows.items(), key=lambda kv: order.index(kv[0]) if kv[0] in order else len(order)))
@@ -1251,6 +1560,7 @@ class App(ctk.CTk):
         self._extra = extra
         self.layout_msg = msg; self.after(30, self.update_badges); self.set_active_label()
 
+    # Positions one tile cell at a rectangle and rounds its corners (v28 or earlier).
     def place(self, hw, rect):
         x, y, w, h = rect
         cell = self.cell_for(hw)
@@ -1263,6 +1573,7 @@ class App(ctk.CTk):
             elif user32.GetParent(hw) != cell.winfo_id(): embed_window(hw, cell.winfo_id())   # never size a top-level as a tile
             fit_child(hw, w, h)
 
+    # Shows or hides the 'Focused' placeholder in the focused account's slot (v28 or earlier).
     def sync_ph(self, wins, slots):
         name = next((n for n, h in self.windows.items() if h == self.active), None)
         show = name and len(wins) > 1 and self.active in wins
@@ -1281,10 +1592,13 @@ class App(ctk.CTk):
             self.ph_name = tk.Label(inner, bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 11))
             self.ph_name.place(relx=0.5, rely=0.6, anchor="center")
             self.ph_press = None                             # press-and-drag the placeholder onto a tile = switch with it
+            # Placeholder: mouse press, remembers where it started (added v33).
             def down(e): self.ph_press = (e.x_root, e.y_root)
+            # Placeholder: after 8 px of movement starts dragging the focused account (added v33).
             def move(e):
                 if self.ph_press and (self.drag or abs(e.x_root - self.ph_press[0]) + abs(e.y_root - self.ph_press[1]) > 8):
                     self.drag_tile(self.ph_name.cget("text"), e)
+            # Placeholder: mouse release, drops the dragged focused account on a tile (added v33).
             def up(e):
                 if self.drag: self.drop_tile(self.ph_name.cget("text"), e)
                 self.ph_press = None
@@ -1295,6 +1609,7 @@ class App(ctk.CTk):
         if self.ph.rgn != (w, h): self.ph.rgn = (w, h); round_region(self.ph.winfo_id(), w, h, RADIUS)
         if self.ph_name.cget("text") != name: self.ph_name.configure(text=name)
 
+    # Returns (creating if needed) the tile cell that holds a game window (v28 or earlier).
     def cell_for(self, hw):
         cell = self.cells.get(hw)
         if cell is None:
@@ -1317,6 +1632,7 @@ class App(ctk.CTk):
             if c.winfo_rootx() <= x < c.winfo_rootx() + c.winfo_width() and c.winfo_rooty() <= y < c.winfo_rooty() + c.winfo_height():
                 return hw
 
+    # While a name tag is dragged: moves the ghost label and highlights the tile under the mouse (v28 or earlier).
     def drag_tile(self, n, e):
         if self.drag is None:
             ghost = tk.Label(self.stage, text=n, bg=TXT, fg=BG, font=("Segoe UI Semibold", 11), padx=10, pady=4)
@@ -1330,10 +1646,12 @@ class App(ctk.CTk):
             if t: self.mark_target(t, True)                      # highlighted border = drop target
             d["target"] = t
 
+    # Highlights or un-highlights a drop target (a tile or the Focused placeholder) (added v33).
     def mark_target(self, t, on):
         w = self.ph if t == "PH" else self.cells.get(t)
         if w is not None: w.configure(bg=TXT if on else BTN_H)
 
+    # Finishes a drag: reorders tiles, or swaps with the Focused tile and focuses the account (v28; swap added v33).
     def drop_tile(self, n, e):
         d, self.drag = self.drag, None
         if not d: return
@@ -1352,18 +1670,22 @@ class App(ctk.CTk):
         self.cfg["view_order"] = names + [x for x in self.cfg["view_order"] if x not in names]
         self.retile()
 
+    # Removes the tile cell of a closed window (v28 or earlier).
     def drop_cell(self, hw):
         EMBEDDED.discard(hw); DOCKED.discard(hw); ORIG_STYLE.pop(hw, None); RGN.pop(hw, None)
         c = self.cells.pop(hw, None)
         if c: c.destroy()
         if hw == self.active: self.placeholder(None)
 
+    # Releases every embedded window back to the desktop (v28 or earlier).
     def unembed_all(self):
         for hw in list(EMBEDDED): unembed_window(hw)
         for hw in list(self.cells): self.cells.pop(hw).destroy()
 
+    # Window handle of the app's top-level window (v28 or earlier).
     def top_hwnd(self): return user32.GetAncestor(self.winfo_id(), 2)
 
+    # Parks the focused game window as a real top-level window over the focus pane (v28 or earlier).
     def dock(self, hw):
         if self.modal: return
         x, y, w, h = self.dock_local
@@ -1374,6 +1696,7 @@ class App(ctk.CTk):
         if fresh: self.after(60, lambda: self.give_focus(hw)); self.after(120, lambda: self.kick(hw, True))
         self.set_active_label()
 
+    # Puts a docked window back into its tile cell (v28 or earlier).
     def undock(self, hw, cell):
         user32.SetWindowLongPtrW(hw, GWLP_HWNDPARENT, 0); DOCKED.discard(hw)
         embed_window(hw, cell.winfo_id())
@@ -1401,13 +1724,16 @@ class App(ctk.CTk):
         user32.SetWindowPos(hw, HWND_TOP, BORDER, BORDER, c.winfo_width() - 2 * BORDER + d, c.winfo_height() - 2 * BORDER + d, SWP_NOACTIVATE)
         if grow: self.after(80, lambda: self.nudge(hw, False))
 
+    # Nudges every tile one after another (added v35; used by Refresh status).
     def nudge_all(self):
         for i, hw in enumerate(list(self.cells)): self.after(i * 120, lambda h=hw: self.nudge(h))
 
+    # Updates the 'Focused: name' label (v28 or earlier).
     def set_active_label(self):
         name = next((n for n, h in self.windows.items() if h == self.active), None)
         self.active_label.configure(text=f"Focused: {name}" if name else "Focused: -")
 
+    # Makes a window the focused one (swaps it with the previous focused tile) (v28 or earlier).
     def switch_to(self, hw):
         if hw == self.active: return
         old, self.active = self.active, hw
@@ -1419,6 +1745,7 @@ class App(ctk.CTk):
         self.stage.update_idletasks()
         self.after(10, self.update_badges); self.after(50, lambda: self.give_focus(hw)); self.after(150, self.verify_layout)
 
+    # Dashboard 'Show' button: opens the Viewer and focuses that account (v28 or earlier).
     def show(self, n):
         hw = self.windows.get(n)
         if not hw or hw not in self.live(): return
@@ -1432,10 +1759,12 @@ class App(ctk.CTk):
         else: return self.say("No instance running")
         self.retile()
 
+    # Keeps the Fullscreen button text in sync (v28 or earlier).
     def sync_fs(self):
         t = "Exit fullscreen" if self.maxed else "Fullscreen"
         if self.fs.cget("text") != t: self.fs.configure(text=t)
 
+    # Preset menu for tile size: only fills the fields, 'Apply' commits (v28 or earlier).
     def pick_size(self, choice):                             # only fills the fields; "Apply" commits them
         w, h = choice.split("x"); self.v["windowWidth"].set(w); self.v["windowHeight"].set(h)
 
@@ -1483,9 +1812,10 @@ class App(ctk.CTk):
         if self._rz: self.after_cancel(self._rz)
         self._rz = self.after(200, self.end_resize)
 
+    # Redraws the UI once after a window resize has finished (v28 or earlier).
     def end_resize(self):
         self._rz = None
-        self.tv.pack(fill="both", expand=True, padx=14, pady=14)
+        self.tv.pack(fill="both", expand=True, padx=6, pady=8)
         self.update_idletasks(); self.sizing = False
         self.after(50, self.settle)
 
@@ -1500,14 +1830,17 @@ class App(ctk.CTk):
             except Exception: pass
         self.on_stage()
 
+    # Viewer stage was resized: schedules a re-layout (v28 or earlier).
     def on_stage(self, _=None):
         if self._relayout: self.after_cancel(self._relayout)
         self._relayout = self.after(200, self._do_relayout)
 
+    # Runs the scheduled re-layout when the Viewer is visible (v28 or earlier).
     def _do_relayout(self):
         self._relayout = None
         if self.cells and self.tv.get() == "Viewer" and self.stage.winfo_width() > 200: self.retile()
 
+    # Walks up from a clicked child window to the game window it belongs to (v28 or earlier).
     def owner_of(self, h):
         mine = set(self.windows.values())
         for _ in range(8):                                   # walk up from a clicked child window to one of ours
@@ -1536,6 +1869,22 @@ class App(ctk.CTk):
         if self._dirty and self._tab == "Viewer": self._dirty = False; self.after(60, self.retile)
         self.after(40 if self._tab == "Viewer" and self.cells else 200, self.poll)
 
+    # Wakes track_dock immediately (and optionally switches it to the fast 10 ms rate for 0.6 s) (added v38).
+    def kick_track(self, fast=False):
+        if fast: self.dock_fast_until = time.time() + 0.6
+        if self._td:
+            try: self.after_cancel(self._td)
+            except Exception: pass
+        self.track_dock()
+
+    # The manager window was moved: switch the docked game window to fast following at once (added v38).
+    def on_move(self, e):
+        if e.widget is not self: return
+        pos = (self.winfo_x(), self.winfo_y())
+        if pos != self._winpos:
+            self._winpos = pos
+            if self.ready: self.kick_track(True)
+
     def track_dock(self):
         """Keep the docked window glued to the focus pane when the app moves/resizes; hide it off the Viewer tab."""
         try:
@@ -1550,6 +1899,7 @@ class App(ctk.CTk):
                     r = win_rect(hw)
                     bad = (user32.GetWindowLongPtrW(hw, GWL_STYLE) & WS_CAPTION == WS_CAPTION or user32.GetWindowLongPtrW(hw, GWL_STYLE) & WS_THICKFRAME) or \
                           max(abs(r.left - want[0]), abs(r.top - want[1]), abs(r.right - r.left - w), abs(r.bottom - r.top - h)) > 2
+                    if bad: self.dock_fast_until = time.time() + 0.5
                     if bad and self.dock_fix < 25:           # Roblox put its frame/size back (e.g. while still starting): dock it again
                         if not self.dock_fix: self.log("Focused window left its pane - re-docking", "warn")
                         self.dock_fix += 1
@@ -1557,11 +1907,17 @@ class App(ctk.CTk):
                         user32.SetWindowPos(hw, 0, *want, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED)
                         self.last_dock = want; self.after(80, lambda h=hw: self.kick(h, True))
                     elif want != self.last_dock or not user32.IsWindowVisible(hw):
+                        self.dock_fast_until = time.time() + 0.5
                         user32.SetWindowPos(hw, 0, *want, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW)
                         self.last_dock = want
                     if not bad: self.dock_fix = 0
         finally:
-            self.after(80, self.track_dock)
+            fast = time.time() < self.dock_fast_until
+            if fast != self.hires:
+                try: (ctypes.windll.winmm.timeBeginPeriod if fast else ctypes.windll.winmm.timeEndPeriod)(1)
+                except Exception: pass
+                self.hires = fast
+            self._td = self.after(10 if fast else 80 if self.dock_fix else 200, self.track_dock)
 
     def verify_layout(self):
         """Self-heal: a tile that re-parented itself, regained its frame, or drifted gets put back."""
@@ -1581,6 +1937,7 @@ class App(ctk.CTk):
                 self.fixes[hw] = self.fixes.get(hw, 0) + 1   # stop nagging a window that truly can't resize
                 fit_child(hw, w, h)
 
+    # Every 1.5 s verifies the docked layout and repairs it (v28 or earlier).
     def heal_loop(self):
         try: self.verify_layout()
         finally: self.after(1500, self.heal_loop)
@@ -1604,6 +1961,7 @@ class App(ctk.CTk):
                 b.raise_above(c.winfo_id())
             except Exception: pass
 
+    # Every 0.4 s refreshes the username tags while the Viewer is open (v28 or earlier).
     def badge_loop(self):
         try:
             if self.cells and self.tv.get() == "Viewer": self.update_badges()
@@ -1617,6 +1975,27 @@ class App(ctk.CTk):
             return p.cpu_percent(None) / (psutil.cpu_count() or 1), p.memory_info().rss / 1048576
         except Exception: return None, None
 
+    def disk_rate(self, n, pid):
+        """Read / write bytes per second of an instance since the last look (needs the process kept by usage())."""
+        try:
+            p = self.procs.get(n)
+            if not p or p.pid != pid: return None
+            io = p.io_counters(); t = time.time(); prev = self.io_prev.get(pid)
+            if len(self.io_prev) > 64: self.io_prev = {k: v for k, v in self.io_prev.items() if psutil.pid_exists(k)}
+            if prev and t - prev[0] < 0.5: return None
+            self.io_prev[pid] = (t, io.read_bytes, io.write_bytes)
+            if not prev: return None
+            dt = t - prev[0]
+            return max(0, io.read_bytes - prev[1]) / dt, max(0, io.write_bytes - prev[2]) / dt
+        except Exception: return None
+
+    # Blanks an account row's values and sets its status dot (added v37).
+    def clear_row(self, r, st=None, col=MUTED):
+        if st is not None: put(r, "st", st, col)
+        put(r, "dot", "●", col)
+        for k in ("tm", "cpu", "ram", "gpu", "vram", "rd", "wr"): put(r, k, "")
+
+    # Refreshes every account row and the summary each 2 s: status, timer, CPU/RAM/GPU, outdated check, performance columns (v28; extended v29-v37).
     def update_rows(self):
         run = frozen = disc = crashed = 0; ram = cpu_t = gpu_t = 0.0
         for n, hw in list(self.windows.items()):            # gone for 2 checks in a row = crashed / closed
@@ -1638,27 +2017,61 @@ class App(ctk.CTk):
                 cpu, mb = self.usage(n, pid_of(hw))
                 if self.hung[n] >= 2: state, text, col = "frozen", "Frozen (not responding)", ORANGE; frozen += 1
                 elif n in self.disconnected: state, text, col = "disc", "Disconnected - not in a game", RED; disc += 1
-                else: state, text, col = "run", "Running", GREEN; run += 1
+                else:
+                    state, text, col = "run", "Running", GREEN; run += 1
+                    pid = pid_of(hw); b = self.build_of(pid)
+                    if b and self.latest_ver and b != self.latest_ver:        # started from an older Roblox build
+                        text, col = "Running (outdated)", ORANGE
+                        if pid not in self.out_logged:
+                            self.out_logged.add(pid); self.log(f"{n}: running an outdated Roblox build - Rejoin it to update", "warn")
                 if state != self.prev_state.get(n):
                     if state == "frozen": self.log(f"{n}: not responding", "warn")
                     elif self.prev_state.get(n) == "frozen": self.log(f"{n}: responding again", "ok")
                     self.prev_state[n] = state
                 if cpu is not None: cpu_t += cpu; ram += mb; self.last_use[n] = (cpu, mb)
-                put(r, "st", text, col)
+                put(r, "st", text, col); put(r, "dot", "●", col)
+                t0 = self.started.get(n); put(r, "tm", f"In game {fmt_dur(time.time() - t0)}" if t0 else "")
                 put(r, "cpu", "n/a" if cpu is None else f"{cpu:.0f}%"); put(r, "ram", "n/a" if mb is None else f"{mb:.0f} MB")
-                g = self.gpu.get(pid_of(hw))
-                put(r, "gpu", "GPU n/a" if self.gpu_ok is False else "GPU -" if self.gpu_ok is None else f"GPU {g or 0:.0f}%")
+                pid = pid_of(hw); g = self.gpu.get(pid); pre = "" if r.get("perf") else "GPU "
+                put(r, "gpu", f"{pre}n/a" if self.gpu_ok is False else f"{pre}-" if self.gpu_ok is None else f"{pre}{g or 0:.0f}%")
                 if g: gpu_t += g
+                if r.get("perf"):
+                    put(r, "vram", "-" if self.vram_ok is None else "n/a" if not self.vram_ok else fmt_bytes(self.vram.get(pid, 0)))
+                    d = self.disk_rate(n, pid)
+                    if d: put(r, "rd", fmt_rate(d[0])); put(r, "wr", fmt_rate(d[1]))
             elif n in self.crashed:
                 crashed += 1
                 u = self.crash_use.get(n)
-                put(r, "st", f"Crashed / closed ({self.crashed[n]})", RED)
-                put(r, "cpu", f"{u[0]:.0f}%" if u else "-"); put(r, "ram", f"{u[1]:.0f} MB" if u else "-"); put(r, "gpu", "")
-        txt = (f"Running {run}   Frozen {frozen}   Disconnected {disc}   Crashed {crashed}      "
-                         f"RAM {ram/1024:.1f} GB   CPU {cpu_t:.0f}%" +
-                         ("" if not self.gpu_ok else f"   GPU {min(100, gpu_t):.0f}% (system {self.gpu_total:.0f}%)"))
-        if txt != self.summary.get(): self.summary.set(txt)
+                put(r, "st", f"Crashed / closed ({self.crashed[n]})", RED); put(r, "tm", ""); put(r, "dot", "●", RED)
+                put(r, "cpu", f"{u[0]:.0f}%" if u else "-"); put(r, "ram", f"{u[1]:.0f} MB" if u else "-")
+                for k in ("gpu", "vram", "rd", "wr"): put(r, k, "")
+        for k, t in (("run", f"Running {run}"), ("frozen", f"Frozen {frozen}"), ("disc", f"Disconnected {disc}"),
+                     ("crashed", f"Crashed {crashed}"), ("ram", f"RAM {ram/1024:.1f} GB"), ("cpu", f"CPU {cpu_t:.0f}%"),
+                     ("gpu", f"GPU {min(100, gpu_t):.0f}%" if self.gpu_ok else "GPU n/a")):
+            put(self.sum, k, t)
 
+    def version_loop(self):
+        """Asks Roblox which build is current (every 15 min). Network trouble just keeps the last answer."""
+        while True:
+            wait = 120
+            try:
+                r = requests.get(RBX_VERSION_URL, timeout=10); r.raise_for_status()
+                v = r.json().get("clientVersionUpload")
+                if v: self.latest_ver, wait = v, 900
+            except Exception: pass
+            time.sleep(wait)
+
+    def build_of(self, pid):
+        """Roblox build folder (version-xxxxxxxx) a running instance was started from; cached per process."""
+        if pid not in self.pid_build:
+            if len(self.pid_build) > 64: self.pid_build = {p: b for p, b in self.pid_build.items() if psutil.pid_exists(p)}
+            try:
+                b = os.path.basename(os.path.dirname(psutil.Process(pid).exe()))
+                self.pid_build[pid] = b if b.startswith("version-") else None
+            except Exception: self.pid_build[pid] = None
+        return self.pid_build[pid]
+
+    # Background thread that samples GPU and VRAM usage every ~1.5 s (added v29; VRAM v37).
     def gpu_loop(self):
         while True:
             try:
@@ -1666,6 +2079,7 @@ class App(ctk.CTk):
                 r = gpu_sample()
                 if r is None: self.gpu_ok = False; time.sleep(30); continue      # counters missing (old Windows / no driver)
                 self.gpu, self.gpu_total, self.gpu_ok = r[0], r[1], True
+                self.vram_ok = r[2] is not None; self.vram = r[2] or {}
             except Exception: time.sleep(5)
 
     def rebind(self, n, old):
@@ -1688,15 +2102,17 @@ class App(ctk.CTk):
             r = self.rows.get(a["name"])
             if r and a["name"] not in self.windows:
                 bad = self.cookie_ok.get(a["name"]) is False
-                put(r, "st", "Cookie expired - re-login" if bad else "Idle", RED if bad else MUTED); put(r, "cpu", ""); put(r, "ram", "")
+                self.clear_row(r, "Cookie expired - re-login" if bad else "Idle", RED if bad else MUTED)
         self.update_rows(); self.nudge_all()
         threading.Thread(target=self._refresh_presence, daemon=True).start()
 
+    # Refresh status button, worker part: re-checks who is really in a game (v28 or earlier).
     def _refresh_presence(self):
         try: self.check_presence(list(self.windows))
         except Exception as ex: self.log(f"Status refresh error: {str(ex)[:70]}", "warn")
         self.after(1500, self.update_rows)
 
+    # Every 2 s calls update_rows (v28 or earlier).
     def dash(self):
         try: self.update_rows()
         finally: self.after(2000, self.dash)
@@ -1705,16 +2121,19 @@ class App(ctk.CTk):
     def prio_class(self, n):
         return 0x40 if n in self.cfg["idle_prio"] else 0x4000 if self.cfg["lowprio"] else 0x20   # IDLE / BELOW_NORMAL / NORMAL
 
+    # Sets a process priority class for an instance (v28 or earlier).
     def set_priority(self, n, cls):
         hw = self.windows.get(n)
         hp = hw and user32.IsWindow(hw) and kernel32.OpenProcess(0x0200 | 0x0400, False, pid_of(hw))
         if hp: kernel32.SetPriorityClass(hp, cls); kernel32.CloseHandle(hp)
 
+    # 'Low prio' checkbox of an account: stores it and applies it (v28 or earlier).
     def set_idle_prio(self, n, on):
         s = set(self.cfg["idle_prio"]); (s.add if on else s.discard)(n)
         self.cfg["idle_prio"] = sorted(s); self.set_priority(n, self.prio_class(n))
         self.log(f"{n}: lowest priority {'on' if on else 'off'}")
 
+    # Trims RAM of every running instance (also run automatically by maintenance) (v28 or earlier).
     def do_trim(self):
         ok = blocked = 0
         for n, hw in list(self.windows.items()):
@@ -1730,6 +2149,7 @@ class App(ctk.CTk):
     # ---------- global hotkeys (RegisterHotKey on one idle thread; costs nothing until a key is pressed) ----------
     HK_KEYS = [(i, 0x30 + i, str(i)) for i in range(1, 10)] + [(10, 0x25, "Left"), (11, 0x27, "Right")]
 
+    # Starts or stops the global Ctrl+Shift hotkey thread (v28 or earlier).
     def hotkeys(self, on):
         th = self.hk_thread
         if on and not (th and th.is_alive()):
@@ -1737,6 +2157,7 @@ class App(ctk.CTk):
         elif not on and th and th.is_alive():
             user32.PostThreadMessageW(self.hk_tid, 0x0012, 0, 0); th.join(1)       # WM_QUIT; the thread unregisters itself
 
+    # Hotkey thread: registers the hotkeys and forwards presses to the main thread (v28 or earlier).
     def _hk_loop(self):
         msg = wt.MSG()
         user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)                      # creates this thread's message queue
@@ -1747,6 +2168,7 @@ class App(ctk.CTk):
             if msg.message == 0x0312: self.after(0, lambda i=int(msg.wParam): self.hotkey(i))
         for i, _, _ in self.HK_KEYS: user32.UnregisterHotKey(None, i)
 
+    # Handles one Ctrl+Shift hotkey press: 1-9 focus that account by position, Left / Right focus the previous / next one (v28 or earlier).
     def hotkey(self, i):
         if self.modal or self.busy: return
         alive = self.live(); names = [n for n, h in self.windows.items() if h in alive]
@@ -1761,11 +2183,13 @@ class App(ctk.CTk):
     def run_seq(self, steps):
         if not steps: return
         d, fn = steps[0]
+        # Runs one step of the Anti-AFK sequence, then the rest (run_seq helper).
         def go():
             try: fn()
             finally: self.run_seq(steps[1:])
         self.after(d, go)
 
+    # Starts an Anti-AFK round (clicks each account's window); waits when the user is active or the app is minimized (v28 or earlier).
     def start_afk(self, force=False):
         if self.afk_busy: return
         if self.state() == "iconic":
@@ -1789,21 +2213,25 @@ class App(ctk.CTk):
         self.log(f"Anti-AFK round started ({len(wins)} instances)")
         self.run_seq(steps)
 
+    # Moves the cursor to the Anti-AFK click spot of a window (v28 or earlier).
     def afk_aim(self, hw):
         self.afk_hw = hw
         rc = wt.RECT(); user32.GetClientRect(hw, ctypes.byref(rc)); off = max(1, self.cfg["afk_off"])
         pt = wt.POINT(max(1, rc.right - off), max(1, rc.bottom - off)); user32.ClientToScreen(hw, ctypes.byref(pt))
         user32.SetCursorPos(pt.x, pt.y); self.afk_pt = pt
 
+    # Presses the mouse only if the cursor is really over that game window (v28 or earlier).
     def afk_down(self):
         pt = self.afk_pt
         self.afk_pressed = bool(pt and self.afk_hw and user32.IsWindow(self.afk_hw)
                                 and self.owner_of(user32.WindowFromPoint(pt)) == self.afk_hw)   # never click anything else
         if self.afk_pressed: user32.mouse_event(2, 0, 0, 0, 0)
 
+    # Releases the mouse button after afk_down (v28 or earlier).
     def afk_up(self):
         if self.afk_pressed: user32.mouse_event(4, 0, 0, 0, 0); self.afk_pressed = False
 
+    # Restores the previous tab, focused account and cursor after an Anti-AFK round (v28 or earlier).
     def afk_finish(self):
         prev_tab, prev_active = self.afk_prev
         if prev_active in self.live() and prev_active != self.active: self.switch_to(prev_active)
@@ -1812,6 +2240,7 @@ class App(ctk.CTk):
         self.afk_busy = False
         self.log("Anti-AFK round done", "ok")
 
+    # Background thread: runs the automatic RAM trim and starts the scheduled Anti-AFK rounds on their timers (v28 or earlier).
     def maintenance(self):
         last_trim = time.time()
         while True:
@@ -1855,12 +2284,14 @@ class App(ctk.CTk):
         except Exception as ex:
             self.log(f"Update check failed: {str(ex)[:80]}", "warn")
 
+    # Asks whether to restart after an update was installed (v28 or earlier).
     def offer_restart(self, new):
         n = len(self.live())
         msg = f"Better RAM v{new} was downloaded and installed.\n\nRestart now to use it?"
         if n: msg += f"\n\n{n} Roblox window(s) will be released to the desktop (not closed)."
         if self.confirm("Update installed", msg, [("Restart", True), ("Later", False)]): self.restart()
 
+    # Restarts the app (used after an update) (v28 or earlier).
     def restart(self):
         self.save()
         subprocess.Popen([sys.executable, os.path.abspath(__file__)], creationflags=0x00000008)   # DETACHED_PROCESS
