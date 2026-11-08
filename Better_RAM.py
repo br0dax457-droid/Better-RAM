@@ -4,7 +4,7 @@ Better RAM - Windows only.
     python Better_RAM.py   (relaunches itself without a console window; add --console to keep it)
 
 Layout: small embedded tiles on the left, the focused instance docked as a real window over the right pane.
-Tabs: Dashboard (accounts) | Viewer | Log (timestamped events) | Settings.
+Tabs: Dashboard (accounts + log) | Viewer | Settings.
 Uses the same accounts file (%APPDATA%\\AltManager.json) as every earlier version.
 """
 import atexit, base64, ctypes, ctypes.wintypes as wt, json, os, random, re, shutil, socket, stat, struct, subprocess, sys, tempfile, threading, time
@@ -23,7 +23,7 @@ except Exception: pass
 try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("BetterRAM.App")   # own taskbar identity -> own icon
 except Exception: pass
 
-VERSION = 18                       # bump this in the file you publish; running copies update when it is higher
+VERSION = 34                       # bump this in the file you publish; running copies update when it is higher
 UPDATE_URL = "https://raw.githubusercontent.com/br0dax457-droid/Better-RAM/main/Better_RAM.py"   # built-in update link
 
 # ======================= dependencies: install what's missing, re-check weekly =======================
@@ -88,7 +88,6 @@ user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
 user32.GetWindowLongPtrW.argtypes = [wt.HWND, ctypes.c_int]
 user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
 user32.SetWindowLongPtrW.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_ssize_t]
-user32.SetLayeredWindowAttributes.argtypes = [wt.HWND, wt.DWORD, wt.BYTE, wt.DWORD]
 user32.SetWindowRgn.argtypes = [wt.HWND, ctypes.c_void_p, wt.BOOL]
 gdi32 = ctypes.windll.gdi32
 gdi32.CreateRoundRectRgn.restype = ctypes.c_void_p
@@ -98,14 +97,55 @@ gdi32.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
 BG, CARD, FIELD, BTN, BTN_H = "#08080a", "#141518", "#1e2024", "#2a2c32", "#3a3d45"
 TXT, MUTED, GREEN, ORANGE, RED = "#ececee", "#8a8d96", "#5fd38d", "#f0a030", "#ff6b6b"
 
-DEFAULTS = {"accounts": [], "games": [], "place": "", "job": "", "delay": 6,
+DEFAULTS = {"accounts": [], "games": [], "place": "", "delay": 6,
             "pane": 38, "micro": False, "windowWidth": 320, "windowHeight": 240, "badges": True,
             "gfx": True, "fps": 15, "quality": 1, "mute": True,
             "trim": True, "trim_sec": 90, "lowprio": True,
             "afk": False, "afk_min": 8, "afk_off": 8, "afk_gap": 1200,
             "watch": True, "watch_sec": 60, "auto_rejoin": False, "afk_skip": [], "idle_prio": [], "view_order": [],
             "update_url": "", "auto_update": True, "hotkeys": True}
-STR_KEYS = {"place", "job", "update_url"}
+STR_KEYS = {"place", "update_url"}
+
+# ======================= GPU usage (Windows "GPU Engine" performance counters) =======================
+class _PdhVal(ctypes.Structure): _fields_ = [("CStatus", ctypes.c_ulong), ("d", ctypes.c_double)]
+class _PdhItem(ctypes.Structure): _fields_ = [("name", ctypes.c_wchar_p), ("val", _PdhVal)]
+_GPU_RE = re.compile(r"pid_(\d+)_luid_(\S+?)_phys_(\d+)_eng_\d+_engtype_(\w+)", re.I)
+
+def gpu_sample(wait=1.0):
+    """-> ({pid: gpu %}, total gpu %) or None when the counters are unavailable. Same maths as Task Manager:
+    sum per engine type, then the busiest engine type counts. A fresh query each time so new processes are seen."""
+    try:
+        pdh = ctypes.windll.pdh
+        pdh.PdhOpenQueryW.argtypes = [ctypes.c_wchar_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)]
+        pdh.PdhAddEnglishCounterW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)]
+        pdh.PdhCollectQueryData.argtypes = [ctypes.c_void_p]
+        pdh.PdhCloseQuery.argtypes = [ctypes.c_void_p]
+        pdh.PdhGetFormattedCounterArrayW.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+                                                      ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p]
+        q, c = ctypes.c_void_p(), ctypes.c_void_p()
+        if pdh.PdhOpenQueryW(None, 0, ctypes.byref(q)) != 0: return None
+        try:
+            if pdh.PdhAddEnglishCounterW(q, r"\GPU Engine(*)\Utilization Percentage", 0, ctypes.byref(c)) != 0: return None
+            pdh.PdhCollectQueryData(q); time.sleep(wait); pdh.PdhCollectQueryData(q)
+            size, cnt = ctypes.c_ulong(0), ctypes.c_ulong(0)
+            pdh.PdhGetFormattedCounterArrayW(c, 0x200, ctypes.byref(size), ctypes.byref(cnt), None)    # PDH_FMT_DOUBLE, size query
+            if not size.value: return {}, 0.0
+            buf = ctypes.create_string_buffer(size.value)
+            if pdh.PdhGetFormattedCounterArrayW(c, 0x200, ctypes.byref(size), ctypes.byref(cnt), buf) != 0: return None
+            items = ctypes.cast(buf, ctypes.POINTER(_PdhItem))
+            per, tot = {}, {}
+            for i in range(cnt.value):
+                it = items[i]; m = _GPU_RE.search(it.name or "")
+                if not m or it.val.CStatus not in (0, 1): continue
+                pid, adapter, eng = int(m.group(1)), (m.group(2), m.group(3)), m.group(4).lower()
+                v = max(0.0, it.val.d)
+                per[(pid, adapter, eng)] = per.get((pid, adapter, eng), 0.0) + v
+                tot[(adapter, eng)] = tot.get((adapter, eng), 0.0) + v
+            by_pid = {}
+            for (pid, _, _), v in per.items(): by_pid[pid] = max(by_pid.get(pid, 0.0), v)
+            return {p: min(100.0, v) for p, v in by_pid.items()}, min(100.0, max(tot.values(), default=0.0))
+        finally: pdh.PdhCloseQuery(q)
+    except Exception: return None
 
 # ======================= cookies (Windows DPAPI) =======================
 class BLOB(ctypes.Structure):
@@ -254,7 +294,7 @@ WS_CAPTION, WS_THICKFRAME, WS_SYSMENU = 0x00C00000, 0x00040000, 0x00080000
 WS_MINIMIZEBOX, WS_MAXIMIZEBOX, WS_CLIPCHILDREN = 0x00020000, 0x00010000, 0x02000000
 WS_EX_WINDOWEDGE, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME = 0x0100, 0x0200, 0x0001
 WS_EX_APPWINDOW, WS_EX_TOOLWINDOW = 0x00040000, 0x0080
-WS_EX_LAYERED, LWA_ALPHA = 0x00080000, 2
+WS_EX_LAYERED = 0x00080000
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_NOACTIVATE, SWP_FRAMECHANGED, SWP_SHOWWINDOW = 1, 2, 4, 0x10, 0x20, 0x40
 HWND_TOP = 0
 STRIP = WS_POPUP | WS_CHILD | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
@@ -272,6 +312,10 @@ def roblox_windows():
         return True
     user32.EnumWindows(WNDENUMPROC(cb), 0)
     return found
+
+def roblox_pids():
+    try: return {p.pid for p in psutil.process_iter(["name"]) if (p.info["name"] or "").lower() == "robloxplayerbeta.exe"}
+    except Exception: return set()
 
 def pid_of(h):
     p = wt.DWORD(); user32.GetWindowThreadProcessId(h, ctypes.byref(p)); return p.value
@@ -306,7 +350,7 @@ def _restyle(hw, add, add_ex=0):
     st = user32.GetWindowLongPtrW(hw, GWL_STYLE); ex = user32.GetWindowLongPtrW(hw, GWL_EXSTYLE)
     ORIG_STYLE.setdefault(hw, (st, ex))
     user32.SetWindowLongPtrW(hw, GWL_STYLE, ((st & 0xFFFFFFFF) & ~STRIP) | add)
-    user32.SetWindowLongPtrW(hw, GWL_EXSTYLE, (ex & ~STRIP_EX) | add_ex)
+    user32.SetWindowLongPtrW(hw, GWL_EXSTYLE, (ex & ~(STRIP_EX | WS_EX_LAYERED)) | add_ex)
 
 def embed_window(hw, parent):
     _restyle(hw, WS_CHILD | WS_VISIBLE)
@@ -317,12 +361,9 @@ def dock_window(hw, owner, sx, sy, w, h, raise_=True):
     """Focused instance: a REAL top-level window (true OS focus/clicks), owned by the manager, parked over the pane."""
     if hw not in DOCKED:
         if hw in EMBEDDED:                                        # as a child its (BORDER, BORDER) becomes SCREEN coordinates
-            user32.SetWindowLongPtrW(hw, GWL_EXSTYLE, user32.GetWindowLongPtrW(hw, GWL_EXSTYLE) | WS_EX_LAYERED)
-            user32.SetLayeredWindowAttributes(hw, 0, 0, LWA_ALPHA)    # -> invisible while it changes parent (no flash top-left)
-            user32.SetParent(hw, 0)
+            user32.ShowWindow(hw, 0); user32.SetParent(hw, 0)     # -> hidden while it changes parent (no flash top-left)
         clear_region(hw)                                          # the focused window is not clipped
-        _restyle(hw, WS_POPUP | WS_VISIBLE, WS_EX_TOOLWINDOW | WS_EX_LAYERED)
-        user32.SetLayeredWindowAttributes(hw, 0, 0, LWA_ALPHA)    # starts invisible; App.fade_in reveals it
+        _restyle(hw, WS_POPUP | WS_VISIBLE, WS_EX_TOOLWINDOW)     # no layered/alpha: that is what left the game surface gray
         user32.SetWindowLongPtrW(hw, GWLP_HWNDPARENT, owner)      # owned: stays above the app, hides with it
         EMBEDDED.add(hw); DOCKED.add(hw)
     user32.SetWindowPos(hw, HWND_TOP, sx, sy, w, h,
@@ -367,7 +408,7 @@ def grid_plan(n, W, H):
 
 class Badge(tk.Frame):
     """Username tag drawn inside the window's own tile and kept above the Roblox child window.
-    Click = focus that account, press-and-drag onto another tile = reorder."""
+    Click = focus that account, press-and-drag onto another tile = reorder, onto the Focused tile = switch with it."""
     def __init__(self, cell, text, on_click, on_drag, on_drop):
         super().__init__(cell, bg="#000000", highlightthickness=0, bd=0)
         self.dot = tk.Label(self, text="●", bg="#000000", fg=GREEN, font=("Segoe UI", 8))
@@ -412,7 +453,7 @@ class App(ctk.CTk):
         BORDER, RADIUS = max(2, round(2 * sc)), round(10 * sc)             # tile border follows the scale
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()       # real pixels (DPI-aware process)
         w = int(min(0.9 * sw / sc, max(920, 0.6 * sw / sc))); h = int(min(0.9 * sh / sc, max(880, 0.8 * sh / sc)))
-        self.title("Better RAM"); self.geometry(f"{w}x{h}"); self.minsize(min(820, w), min(700, h))
+        self.title("Better RAM"); self.geometry(f"{w}x{h}"); self.minsize(min(1100, w), min(700, h))
         self.configure(fg_color=BG)
         self.after(300, self.set_icon)                      # customtkinter sets its own icon at ~200 ms; ours goes on top
         self.protocol("WM_DELETE_WINDOW", self.on_exit)
@@ -424,29 +465,31 @@ class App(ctk.CTk):
         self.windows = {}                                   # account name -> hwnd
         self.crashed, self.hung, self.missing, self.procs = {}, {}, {}, {}
         self.cookie_ok, self.prev_state = {}, {}
+        self.last_use, self.crash_use, self.apid, self.launching = {}, {}, {}, set()               # last seen (cpu %, ram MB) per account / frozen at crash time
         self.disconnected, self.offline, self.rejoin_hist = set(), {}, {}
         self.started, self.launch_info = {}, {}             # launch time / (place, job) per account
         # viewer state
         self.cells, self.badges, self.fixes, self.drag = {}, {}, {}, None
         self.ph = self.ph_name = None                       # "Focused" placeholder tile
-        self.afk_sel, self.afk_cells, self.afk_grid = {}, [], None
+        self.afk_sel = {}
         self.sizing, self.ready, self._size, self._rz = False, False, None, None
         self.hk_thread, self.hk_tid = None, 0
         self.active = self.maxed = None
         self.dock_local = self.last_dock = self._relayout = None
-        self.press, self.was_down, self.app_fg_top, self._tab = None, False, False, ""
+        self.press, self.was_down, self.app_fg_top, self._tab, self._dirty, self.dock_fix = None, False, False, "", False, 0
         # background work
         self.launch_jobs, self.launch_lock = 0, threading.Lock()
         self.afk_busy, self.afk_next = False, time.time() + 480
         self.afk_hw = self.afk_pt = None; self.afk_pressed = False
         self.sel, self.rows, self.v = {}, {}, {}
-        self.status = tk.StringVar(value="Ready"); self.summary = tk.StringVar(value="")
+        self.gpu, self.gpu_total, self.gpu_ok = {}, 0.0, None      # pid -> GPU %, system GPU %, counters available?
+        self.summary = tk.StringVar(value="")
         self.build(); self.refresh()
         self.bind("<Configure>", self.on_resize, add="+"); self.after(1500, lambda: setattr(self, "ready", True))
         for delay, fn in ((40, self.poll), (1000, self.sync), (2000, self.dash), (600, self.badge_loop),
                           (1500, self.heal_loop), (100, self.track_dock)):
             self.after(delay, fn)
-        for fn in (self.maintenance, self.watch_loop):
+        for fn in (self.maintenance, self.watch_loop, self.gpu_loop):
             threading.Thread(target=fn, daemon=True).start()
         if self.cfg["auto_update"]: self.after(4000, lambda: threading.Thread(target=self.check_update, daemon=True).start())
         if self.cfg["hotkeys"]: self.hotkeys(True)
@@ -534,81 +577,102 @@ class App(ctk.CTk):
         tv = self.tv = ctk.CTkTabview(self, fg_color=BG, corner_radius=18, segmented_button_fg_color=CARD,
                                       segmented_button_selected_color=BTN_H, segmented_button_selected_hover_color=BTN_H,
                                       segmented_button_unselected_color=CARD, segmented_button_unselected_hover_color=BTN)
-        tv.pack(fill="both", expand=True, padx=14, pady=(14, 4))
-        dash, view, logt, sett = tv.add("Dashboard"), tv.add("Viewer"), tv.add("Log"), tv.add("Settings")
+        tv.pack(fill="both", expand=True, padx=14, pady=14)
+        dash, view, sett = tv.add("Dashboard"), tv.add("Viewer"), tv.add("Settings")
 
         # --- viewer ---
-        vb = ctk.CTkFrame(view, fg_color="transparent"); vb.pack(fill="x", padx=6, pady=(4, 8))
-        self.btn(vb, "Maximize app", self.toggle_max, w=130).pack(side="left", padx=6)
-        self.btn(vb, "Re-layout", self.unmax, w=110).pack(side="left", padx=6)
-        self.active_label = ctk.CTkLabel(view, text="Focused: -", font=("Segoe UI Semibold", 14), text_color=TXT)
-        self.active_label.pack(anchor="w", padx=14, pady=(0, 8))
-        sb = ctk.CTkFrame(view, fg_color="transparent"); sb.pack(side="bottom", fill="x", padx=6, pady=(0, 4))
-        ctk.CTkButton(sb, text="Anti-AFK now", command=lambda: self.start_afk(True), width=140, height=68, corner_radius=14,
+        top = ctk.CTkFrame(view, fg_color="transparent"); top.pack(fill="x", padx=6, pady=(4, 8))
+        self.active_label = ctk.CTkLabel(top, text="Focused: -", font=("Segoe UI Semibold", 14), text_color=TXT)
+        self.active_label.pack(side="left", padx=8)
+        self.fs = self.btn(top, "Fullscreen", self.fullscreen, w=130, h=32); self.fs.pack(side="right", padx=6)
+        sb = ctk.CTkFrame(view, fg_color="transparent", height=124); sb.pack(side="bottom", fill="x", padx=6, pady=(0, 4))
+        sb.pack_propagate(False)
+        lc = ctk.CTkFrame(sb, fg_color="transparent"); lc.pack(side="left", fill="y", padx=(0, 10))      # left corner, top to bottom
+        ctk.CTkButton(lc, text="Anti-AFK now", command=lambda: self.start_afk(True), width=150, height=32, corner_radius=10,
                       fg_color=TXT, hover_color="#ffffff", text_color=BG,
-                      font=("Segoe UI Semibold", 14)).pack(side="left", padx=(0, 12))
-        tg = ctk.CTkFrame(sb, fg_color="transparent"); tg.pack(side="left", padx=(0, 6))
+                      font=("Segoe UI Semibold", 13)).pack(anchor="w", pady=(4, 6))
         for label, key in (("Anti-AFK", "afk"), ("Connection watch", "watch")):
-            row = ctk.CTkFrame(tg, fg_color="transparent"); row.pack(anchor="w", pady=2); self.check(row, label, key)
-        af = ctk.CTkFrame(sb, fg_color="transparent"); af.pack(side="left", fill="x", expand=True)
-        top = ctk.CTkFrame(af, fg_color="transparent"); top.pack(fill="x")
-        self.afk_label = ctk.CTkLabel(top, text="AFK on:", text_color=MUTED); self.afk_label.pack(side="left", padx=(0, 8))
-        self.btn(top, "All", lambda: self.afk_all(True), w=50, h=26).pack(side="left", padx=(0, 6))
-        self.btn(top, "None", lambda: self.afk_all(False), w=56, h=26).pack(side="left")
-        self.afk_list = ctk.CTkScrollableFrame(af, orientation="vertical", height=32, fg_color=FIELD, corner_radius=8)
-        self.afk_list.pack(fill="x", pady=(2, 0))
+            row = ctk.CTkFrame(lc, fg_color="transparent"); row.pack(anchor="w", pady=3)
+            self.check(row, label, key)
+        rc = ctk.CTkFrame(sb, fg_color="transparent"); rc.pack(side="left", fill="both", expand=True)      # rest of the width
+        hd = ctk.CTkFrame(rc, fg_color="transparent"); hd.pack(fill="x", pady=(0, 4))
+        self.afk_label = ctk.CTkLabel(hd, text="AFK on:", text_color=MUTED); self.afk_label.pack(side="left", padx=(4, 10))
+        self.btn(hd, "All", lambda: self.afk_all(True), w=50, h=26).pack(side="left", padx=(0, 6))
+        self.btn(hd, "None", lambda: self.afk_all(False), w=56, h=26).pack(side="left")
+        self.afk_list = ctk.CTkScrollableFrame(rc, height=60, fg_color=FIELD, corner_radius=8)
+        self.afk_list.pack(fill="both", expand=True)
+        self.afk_cells, self.afk_cols, self.afk_rc, self.afk_sb_on = [], 0, rc, True
+        self.after(10, self.layout_afk)
+        rc.bind("<Configure>", lambda e: self.after(60, self.layout_afk))
         self.stage = tk.Frame(view, bg="#000000", highlightthickness=0)
         self.stage.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.stage.bind("<Configure>", self.on_stage)
         self.empty = tk.Label(self.stage, text="Running instances will be shown here", bg="#000000", fg=MUTED, font=("Segoe UI", 13))
         self.empty.place(relx=0.5, rely=0.5, anchor="center"); self.empty_on = True
 
-        # --- log ---
-        lb = ctk.CTkFrame(logt, fg_color="transparent"); lb.pack(fill="x", padx=6, pady=(4, 8))
+        # --- dashboard: left = game + accounts, right = log, bottom = actions ---
+        dash.grid_columnconfigure(0, weight=3); dash.grid_columnconfigure(1, weight=2); dash.grid_rowconfigure(0, weight=1)
+        left = ctk.CTkFrame(dash, fg_color="transparent"); left.grid(row=0, column=0, sticky="nsew")
+        right = ctk.CTkFrame(dash, fg_color="transparent"); right.grid(row=0, column=1, sticky="nsew")
+        lb = ctk.CTkFrame(right, fg_color="transparent"); lb.pack(fill="x", padx=6, pady=(8, 8))
         self.btn(lb, "Clear", self.clear_log, w=100).pack(side="left", padx=6)
         self.btn(lb, "Open log file", lambda: os.path.exists(LOG) and os.startfile(LOG), w=140).pack(side="left", padx=6)
-        self.logbox = ctk.CTkTextbox(logt, fg_color=CARD, corner_radius=14, text_color=TXT,
+        bar = ctk.CTkFrame(right, fg_color="transparent"); bar.pack(side="bottom", fill="x", padx=6, pady=(0, 4))
+        self.logbox = ctk.CTkTextbox(right, fg_color=CARD, corner_radius=14, text_color=TXT,
                                      font=("Consolas", 13), wrap="word", state="disabled")
         self.logbox.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         for tag, col in (("ok", GREEN), ("warn", ORANGE), ("bad", RED), ("info", TXT)):
             self.logbox.tag_config(tag, foreground=col)
 
-        # --- dashboard: game ---
-        g = self.card(dash)
+        g = self.card(left)
         f = self.line(g)
-        self.v["place"] = tk.StringVar(value=self.cfg["place"]); self.v["job"] = tk.StringVar(value=self.cfg["job"])
-        ctk.CTkEntry(f, textvariable=self.v["place"], width=330, height=38, corner_radius=10, fg_color=FIELD,
-                     border_width=0, placeholder_text="Game ID or roblox.com/games/... link").pack(side="left", padx=(0, 10))
-        ctk.CTkEntry(f, textvariable=self.v["job"], width=170, height=38, corner_radius=10, fg_color=FIELD,
-                     border_width=0, placeholder_text="Job ID (optional)").pack(side="left", padx=(0, 10))
-        self.btn(f, "Save game", self.save_game, w=100).pack(side="left", padx=(0, 8))
+        self.v["place"] = tk.StringVar(value=self.cfg["place"])
+        ctk.CTkEntry(f, textvariable=self.v["place"], width=80, height=38, corner_radius=10, fg_color=FIELD, border_width=0,
+                     placeholder_text="Game ID or roblox.com/games/... link").pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.btn(f, "Save", self.save_game, w=90).pack(side="left")
         f = self.line(g)
-        self.combo = ctk.CTkComboBox(f, values=[""], width=330, height=38, corner_radius=10, fg_color=FIELD,
+        ctk.CTkLabel(f, text="Saved games", text_color=MUTED, width=90, anchor="w").pack(side="left")
+        self.combo = ctk.CTkComboBox(f, values=[""], width=80, height=38, corner_radius=10, fg_color=FIELD,
                                      border_width=0, button_color=BTN, button_hover_color=BTN_H,
                                      dropdown_fg_color=CARD, state="readonly", command=self.pick_game)
-        self.combo.pack(side="left", padx=(0, 10))
-        self.btn(f, "Delete saved", self.del_game, w=110).pack(side="left")
+        self.combo.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkButton(f, text="Delete", command=self.del_game, width=90, height=38, corner_radius=12,
+                      fg_color="#4a1d24", hover_color="#6b2833", text_color="#ff9a9a",
+                      font=("Segoe UI Semibold", 13)).pack(side="left")
+        # what the accounts will actually join (always the ID in the field above)
+        self.join_box = ctk.CTkFrame(g, fg_color=FIELD, corner_radius=12); self.join_box.pack(fill="x", padx=18, pady=(2, 14))
+        self.join_dot = ctk.CTkLabel(self.join_box, text="●", text_color=MUTED, font=("Segoe UI", 16), width=24)
+        self.join_dot.pack(side="left", padx=(12, 2), pady=10)
+        self.join_lbl = ctk.CTkLabel(self.join_box, text="", anchor="w", justify="left", text_color=TXT,
+                                     font=("Segoe UI Semibold", 13), wraplength=520)
+        self.join_lbl.pack(side="left", fill="x", expand=True, padx=(2, 12), pady=10)
+        self.v["place"].trace_add("write", lambda *_: self.after_idle(self.update_game_info))
         self.refresh_games()
 
         # --- dashboard: summary, accounts, actions ---
-        s = ctk.CTkFrame(dash, fg_color=CARD, corner_radius=14); s.pack(fill="x", padx=6, pady=(4, 6))
+        s = ctk.CTkFrame(left, fg_color=CARD, corner_radius=14); s.pack(fill="x", padx=6, pady=(4, 6))
         ctk.CTkLabel(s, textvariable=self.summary, font=("Segoe UI Semibold", 14), text_color=TXT,
                      anchor="w").pack(fill="x", padx=18, pady=12)
-        hd = ctk.CTkFrame(dash, fg_color="transparent"); hd.pack(fill="x", padx=6, pady=(2, 0))
+        hd = ctk.CTkFrame(left, fg_color="transparent"); hd.pack(fill="x", padx=6, pady=(2, 0))
         self.btn(hd, "Select all", self.sel_all, w=110, h=30).pack(side="left", padx=6)
         self.btn(hd, "Deselect all", self.sel_none, w=120, h=30).pack(side="left", padx=6)
         self.btn(hd, "Refresh status", self.refresh_status, w=130, h=30).pack(side="right", padx=6)
-        self.list = ctk.CTkScrollableFrame(dash, fg_color=CARD, corner_radius=18, height=300)
+        self.list = ctk.CTkScrollableFrame(left, fg_color=CARD, corner_radius=18, height=120)
         self.list.pack(fill="both", expand=True, padx=6, pady=6)
-        bar = ctk.CTkFrame(dash, fg_color="transparent"); bar.pack(fill="x", padx=6, pady=(6, 4))
-        ctk.CTkButton(bar, text="Launch selected", command=self.launch, width=190, height=130, corner_radius=14,
+        bar.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkButton(bar, text="Launch selected", command=self.launch, height=40, corner_radius=12,
                       fg_color=TXT, hover_color="#ffffff", text_color=BG,
-                      font=("Segoe UI Semibold", 17)).grid(row=0, column=0, rowspan=3, padx=6, pady=4, sticky="ns")
-        cols = ([("Rejoin selected", self.rejoin_selected), ("Close selected", self.close_selected), ("Close all", self.close_all)],
-                [("Add (paste cookie)", self.add), ("Add via browser", self.add_browser), ("Remove selected", self.remove)],
-                [("Export accounts", self.export_accounts), ("Import accounts", self.import_accounts)])
-        for c, items in enumerate(cols, 1):
-            for r, (text, cmd) in enumerate(items): self.btn(bar, text, cmd, w=150).grid(row=r, column=c, padx=6, pady=4)
+                      font=("Segoe UI Semibold", 15)).grid(row=0, column=0, columnspan=2, padx=4, pady=(4, 6), sticky="ew")
+        grid = ((("Rejoin selected", self.rejoin_selected), ("Close selected", self.close_selected)),
+                (("Add account (paste cookie)", self.add), ("Add account via browser", self.add_browser)),
+                (("Export accounts", self.export_accounts), ("Import accounts", self.import_accounts)),
+                (("Close all", self.close_all), None))
+        for r, items in enumerate(grid, 1):
+            for c, it in enumerate(items):
+                if it: self.btn(bar, it[0], it[1], h=32).grid(row=r, column=c, padx=4, pady=3, sticky="ew")
+        ctk.CTkButton(bar, text="Delete selected accounts", command=self.remove, height=32, corner_radius=12,
+                      fg_color="#4a1d24", hover_color="#6b2833", text_color="#ff9a9a",
+                      font=("Segoe UI Semibold", 13)).grid(row=4, column=1, padx=4, pady=3, sticky="ew")
 
         # --- settings ---
         sc = ctk.CTkScrollableFrame(sett, fg_color=BG); sc.pack(fill="both", expand=True)
@@ -635,7 +699,6 @@ class App(ctk.CTk):
         c = self.card(sc, "RAM trimmer")
         f = self.line(c); self.check(f, "Auto trim", "trim"); self.check(f, "Lower priority", "lowprio")
         self.entry(f, "Every (s)", "trim_sec", 60)
-        f = self.line(c); self.btn(f, "Trim now", self.do_trim, w=120).pack(side="left")
         c = self.card(sc, "Anti-AFK")
         f = self.line(c)
         self.entry(f, "Every (min)", "afk_min", 60); self.entry(f, "Corner offset (px)", "afk_off", 60)
@@ -650,7 +713,7 @@ class App(ctk.CTk):
         f = self.line(c); self.check(f, "Hotkeys", "hotkeys", lambda: self.hotkeys(self.v["hotkeys"].get()))
         ctk.CTkLabel(c, wraplength=700, justify="left", text_color=MUTED,
                      text="Ctrl+Shift+1..9 focus the 1st..9th running account (tile order), Ctrl+Shift+Left / Right = previous / next. "
-                          "Works while a game window has focus. If another program already uses a key, it is listed in the Log tab."
+                          "Works while a game window has focus. If another program already uses a key, it is listed in the log."
                      ).pack(anchor="w", padx=18, pady=(0, 14))
         c = self.card(sc, f"Updates  (installed: v{VERSION})")
         f = self.line(c); self.entry(f, "Update link (https)", "update_url", 430)
@@ -659,25 +722,23 @@ class App(ctk.CTk):
                      text="Link to your newest Better RAM .py file (for example its GitHub 'Raw' link). It is only installed when its "
                           "VERSION number is higher than this one. Only use a link that you alone can edit.").pack(anchor="w", padx=18, pady=(0, 14))
 
-        self.status_lbl = ctk.CTkLabel(self, textvariable=self.status, text_color=GREEN, anchor="w")
-        self.status_lbl.pack(fill="x", padx=24, pady=(2, 12))
-
     # ---------- logging ----------
-    def log(self, msg, kind="info", status=True):
-        """Timestamped event -> Log tab + file (+ status bar). Safe to call from any thread."""
+    def log(self, msg, kind="info"):
+        """Timestamped event -> log panel + file. Safe to call from any thread."""
         stamp = time.strftime("%H:%M:%S")
         try:
             with open(LOG, "a", encoding="utf-8") as fh: fh.write(f"{time.strftime('%Y-%m-%d')} {stamp}  {msg}\n")
         except Exception: pass
-        def ui():
-            if status: self.status.set(msg)
-            self.logbox.configure(state="normal")
-            self.logbox.insert("end", f"{stamp}  {msg}\n", kind)
-            if int(self.logbox.index("end-1c").split(".")[0]) > 1500: self.logbox.delete("1.0", "300.0")
-            self.logbox.configure(state="disabled"); self.logbox.see("end")
-        self.after(0, ui)
+        self.after(0, lambda: self.log_line(stamp, msg, kind))
 
-    def say(self, text): self.after(0, lambda: self.status.set(text))
+    def log_line(self, stamp, msg, kind):
+        self.logbox.configure(state="normal")
+        self.logbox.insert("end", f"{stamp}  {msg}\n", kind)
+        if int(self.logbox.index("end-1c").split(".")[0]) > 1500: self.logbox.delete("1.0", "300.0")
+        self.logbox.configure(state="disabled"); self.logbox.see("end")
+
+    def say(self, text):                                    # short hint ("tick accounts first"): shown in the log panel only
+        stamp = time.strftime("%H:%M:%S"); self.after(0, lambda: self.log_line(stamp, text, "warn"))
 
     def clear_log(self):
         self.logbox.configure(state="normal"); self.logbox.delete("1.0", "end"); self.logbox.configure(state="disabled")
@@ -711,24 +772,46 @@ class App(ctk.CTk):
     # ---------- games ----------
     def glabels(self): return [f'{g["name"]}  ({g["place"]})' for g in self.cfg["games"]]
 
+    def game_for(self, pid): return next((g for g in self.cfg["games"] if g["place"] == pid), None)
+
+    def update_game_info(self):
+        """Shows exactly which game the accounts will join: the ID in the field. Green = saved game, orange = not saved."""
+        try:
+            pid = parse_place(self.v["place"].get()); g = self.game_for(pid) if pid else None
+            if not pid: dot, col, txt = MUTED, MUTED, "No game selected - enter a game ID or link above"
+            elif g: dot, col, txt = GREEN, TXT, f'Accounts will join:  {g["name"]}  (ID {pid})   -   saved'
+            else: dot, col, txt = ORANGE, TXT, f"Accounts will join:  ID {pid}   -   not saved yet (press Save to name it)"
+            self.join_dot.configure(text_color=dot); self.join_lbl.configure(text=txt, text_color=col)
+            lab = f'{g["name"]}  ({g["place"]})' if g else ""
+            if self.combo.get() != lab: self.combo.set(lab)           # menu always shows the saved game that is in use
+        except Exception: pass
+
     def refresh_games(self):
-        self.combo.configure(values=self.glabels() or [""]); self.combo.set("")
+        self.combo.configure(values=self.glabels() or [""]); self.update_game_info()
 
     def pick_game(self, choice):
         L = self.glabels()
         if choice in L: self.v["place"].set(self.cfg["games"][L.index(choice)]["place"])
+        self.update_game_info()
 
     def save_game(self):
         self.collect(); pid = parse_place(self.cfg["place"])
         if not pid: return self.note("Game", "Paste a game ID or link first.")
-        name = self.ask("Save game", "Name for this game:")
+        old = self.game_for(pid)
+        name = self.ask("Save game", "Name for this game:", default=old["name"] if old else "")
         if not name: return
         self.cfg["games"] = [g for g in self.cfg["games"] if g["place"] != pid] + [{"name": name, "place": pid}]
-        self.refresh_games()
+        self.v["place"].set(pid); self.refresh_games()
 
     def del_game(self):
         L = self.glabels(); cur = self.combo.get()
-        if cur in L: del self.cfg["games"][L.index(cur)]; self.refresh_games()
+        if cur not in L: return self.say("No saved game selected - pick one in the Saved games menu first")
+        g = self.cfg["games"][L.index(cur)]
+        if not self.confirm("Delete game", f'Delete the saved game "{g["name"]}" (ID {g["place"]}) from Better RAM?\n\n'
+                            "It is removed from your saved games list and you would have to save it again. "
+                            "Nothing changes on Roblox or on your accounts.", [("Delete", True), ("Cancel", False)]): return
+        self.cfg["games"] = [x for x in self.cfg["games"] if x is not g]
+        self.refresh_games(); self.log(f'Deleted saved game "{g["name"]}"')
 
     # ---------- accounts ----------
     def account(self, name): return next((a for a in self.cfg["accounts"] if a["name"] == name), None)
@@ -747,21 +830,22 @@ class App(ctk.CTk):
             f.grid_columnconfigure(1, weight=1)
             ctk.CTkCheckBox(f, text=n, variable=self.sel[n], onvalue=True, offvalue=False, corner_radius=7,
                             fg_color=TXT, hover_color="#ffffff", checkmark_color=BG, border_color=BTN_H,
-                            text_color=TXT, width=200).grid(row=0, column=0, padx=14, pady=12, sticky="w")
+                            text_color=TXT, width=140).grid(row=0, column=0, padx=(10, 6), pady=10, sticky="w")
             bad = self.cookie_ok.get(n) is False
             st = ctk.CTkLabel(f, text="Cookie expired - re-login" if bad else "Idle",
-                              text_color=RED if bad else MUTED, anchor="w", width=190)
-            cpu = ctk.CTkLabel(f, text="", text_color=MUTED, width=56)
-            ram = ctk.CTkLabel(f, text="", text_color=MUTED, width=84)
+                              text_color=RED if bad else MUTED, anchor="w", width=100)
+            cpu = ctk.CTkLabel(f, text="", text_color=MUTED, width=40)
+            ram = ctk.CTkLabel(f, text="", text_color=MUTED, width=62)
+            gpu = ctk.CTkLabel(f, text="", text_color=MUTED, width=64)
             st.grid(row=0, column=1, padx=6, sticky="w"); cpu.grid(row=0, column=2, padx=4); ram.grid(row=0, column=3, padx=4)
+            gpu.grid(row=0, column=4, padx=4)
             lp = tk.BooleanVar(value=n in self.cfg["idle_prio"])
-            ctk.CTkCheckBox(f, text="Lowest prio", variable=lp, command=lambda n=n, v=lp: self.set_idle_prio(n, v.get()),
-                            width=90, checkbox_width=18, checkbox_height=18, corner_radius=5, fg_color=TXT,
+            ctk.CTkCheckBox(f, text="Low prio", variable=lp, command=lambda n=n, v=lp: self.set_idle_prio(n, v.get()),
+                            width=70, checkbox_width=18, checkbox_height=18, corner_radius=5, fg_color=TXT,
                             hover_color="#ffffff", checkmark_color=BG, border_color=BTN_H, text_color=MUTED,
-                            font=("Segoe UI", 12)).grid(row=0, column=4, padx=(8, 4))
-            self.btn(f, "Show", lambda n=n: self.show(n), w=60).grid(row=0, column=5, padx=(8, 4))
-            self.btn(f, "Max", lambda n=n: self.max_instance(n), w=56).grid(row=0, column=6, padx=(0, 12))
-            self.rows[n] = {"st": st, "cpu": cpu, "ram": ram}
+                            font=("Segoe UI", 12)).grid(row=0, column=5, padx=(6, 2))
+            self.btn(f, "Show", lambda n=n: self.show(n), w=52, h=32).grid(row=0, column=6, padx=(4, 10))
+            self.rows[n] = {"st": st, "cpu": cpu, "ram": ram, "gpu": gpu}
         self.build_afk_list(names); self.after(50, self.update_rows)
 
     def set_status(self, name, text, color=MUTED):
@@ -772,21 +856,41 @@ class App(ctk.CTk):
 
     def afk_box(self, parent, n):
         return ctk.CTkCheckBox(parent, text=n, variable=self.afk_sel[n], command=self.afk_toggle, width=20,
-                               checkbox_width=18, checkbox_height=18, corner_radius=5, fg_color=TXT, hover_color="#ffffff",
+                               height=20, checkbox_width=18, checkbox_height=18, corner_radius=5, fg_color=TXT, hover_color="#ffffff",
                                checkmark_color=BG, border_color=BTN_H, text_color=TXT, font=("Segoe UI", 12))
-
-    AFK_CELL, AFK_ROW, AFK_ROWS = 160, 28, 2         # timetable cell width / row height (px); rows shown before a slider appears
 
     def build_afk_list(self, names):
         for w in self.afk_list.winfo_children(): w.destroy()
         skip = set(self.cfg["afk_skip"])
         self.afk_sel = {n: tk.BooleanVar(value=n not in skip) for n in names}     # the one source of truth
-        self.afk_cells, self.afk_grid = [], None
+        self.afk_cells = []
         for n in names:
-            cell = ctk.CTkFrame(self.afk_list, fg_color=CARD, corner_radius=7, width=self.AFK_CELL, height=24)
-            cell.pack_propagate(False); self.afk_box(cell, n).pack(side="left", padx=6)
-            self.afk_cells.append(cell)
-        self.afk_count(); self.fit_afk()
+            cell = ctk.CTkFrame(self.afk_list, fg_color=CARD, corner_radius=7, width=170, height=24)
+            cell.pack_propagate(False); self.afk_cells.append(cell)
+            self.afk_box(cell, n).pack(anchor="w", padx=8, expand=True)
+        self.afk_cols = 0; self.layout_afk()
+        self.afk_count()
+
+    def layout_afk(self):
+        """Accounts sit side by side in as many columns as fit; extra accounts add rows. The scrollbar (top to bottom)
+        only appears when there are more than 3 rows."""
+        try:
+            w = self.afk_rc.winfo_width()
+            n = len(self.afk_cells)
+            cols = max(1, (max(w, 200) - (24 if n > 3 else 4)) // 176)
+            rows = -(-n // cols) if n else 0
+            if rows > 3 and cols > 1:                       # the scrollbar costs width: recount without it
+                cols = max(1, (max(w, 200) - 24) // 176); rows = -(-n // cols)
+            need = rows > 3
+            if cols != self.afk_cols:
+                self.afk_cols = cols
+                for i, c in enumerate(self.afk_cells): c.grid(row=i // cols, column=i % cols, padx=3, pady=2, sticky="w")
+            sb = self.afk_list._scrollbar
+            if need != self.afk_sb_on:
+                self.afk_sb_on = need
+                if need: sb.grid()
+                else: sb.grid_remove(); self.afk_list._parent_canvas.yview_moveto(0)
+        except Exception: pass
 
     def afk_all(self, on):
         for v in self.afk_sel.values(): v.set(on)
@@ -799,20 +903,6 @@ class App(ctk.CTk):
     def afk_count(self):
         t = f"AFK on ({sum(v.get() for v in self.afk_sel.values())}/{len(self.afk_sel)}):"
         if self.afk_label.cget("text") != t: self.afk_label.configure(text=t)
-
-    def fit_afk(self):
-        """Lay the cells out like a timetable: as many columns as fit the width; the slider only shows when the rows exceed AFK_ROWS."""
-        w = self.afk_list.winfo_width()
-        cols = max(1, (w - 24) // (self.AFK_CELL + 4)) if w > 100 else 1
-        if cols == self.afk_grid: return
-        self.afk_grid = cols
-        for i, c in enumerate(self.afk_cells): c.grid(row=i // cols, column=i % cols, padx=2, pady=2, sticky="w")
-        rows = -(-len(self.afk_cells) // cols)
-        self.afk_list.configure(height=max(1, min(rows, self.AFK_ROWS)) * self.AFK_ROW + 4)
-        bar = getattr(self.afk_list, "_scrollbar", None)
-        if bar:
-            if rows > self.AFK_ROWS: bar.grid()
-            else: bar.grid_remove()
 
     def store_account(self, name, cookie, uid):
         self.cfg["accounts"] = [a for a in self.cfg["accounts"] if a["name"] != name] + \
@@ -902,7 +992,12 @@ class App(ctk.CTk):
         self.refresh(); self.log(f"Imported {len(new)} account(s)", "ok")
 
     def remove(self):
-        gone = set(self.checked())
+        names = self.checked()
+        if not names: return self.say("Tick the accounts you want to delete first")
+        if not self.confirm("Delete accounts", f"Delete {len(names)} account(s) from Better RAM?\n\n" + ", ".join(names) +
+                            "\n\nThe saved logins are removed and you would have to add them again. "
+                            "The Roblox accounts themselves are not touched.", [("Delete", True), ("Cancel", False)]): return
+        gone = set(names)
         self.cfg["accounts"] = [a for a in self.cfg["accounts"] if a["name"] not in gone]
         self.refresh()
 
@@ -923,11 +1018,15 @@ class App(ctk.CTk):
         self.save(); place = parse_place(self.cfg["place"])
         if not place: return self.note("Game", "Enter a game ID or roblox.com/games link.")
         if self.cfg["gfx"]: self.apply_gfx()
-        todo = [a for a in self.cfg["accounts"] if a["name"] in self.checked()]
-        if todo: self.log(f"Launching {len(todo)} account(s) into place {place}")
-        self.start_launch(todo, place, self.cfg["job"])
+        sel = [a for a in self.cfg["accounts"] if a["name"] in self.checked()]
+        todo = [a for a in sel if not (self.windows.get(a["name"]) in self.live() or a["name"] in self.launching)]
+        if len(todo) < len(sel):
+            self.log("Already running or starting, skipped: " + ", ".join(a["name"] for a in sel if a not in todo), "warn")
+        if todo: gm = self.game_for(place); self.log(f"Launching {len(todo)} account(s) into " + (f'{gm["name"]} (place {place})' if gm else f"place {place}"))
+        self.start_launch(todo, place, "")
 
     def start_launch(self, accounts, place, job):
+        self.launching.update(a["name"] for a in accounts)
         if accounts: threading.Thread(target=self._launch_worker, args=(accounts, place, job), daemon=True).start()
 
     def _launch_worker(self, accounts, place, job):
@@ -945,6 +1044,7 @@ class App(ctk.CTk):
                         else:
                             self.set_status(n, f"Error: {str(ex)[:36]}", RED)
                             self.log(f"{n}: launch error - {str(ex)[:80]}", "bad")
+                    finally: self.launching.discard(a["name"])
         finally:
             self.launch_jobs -= 1
 
@@ -954,29 +1054,44 @@ class App(ctk.CTk):
             self.set_status(n, "Cookie expired - skipped", RED); return self.log(f"{n}: skipped (cookie expired)", "warn")
         for i in range(120):                                 # never stack launches on a running installer/updater
             if not installer_running(): break
-            if i == 0: self.log(f"{n}: waiting for the Roblox updater to finish", "warn", status=False)
+            if i == 0: self.log(f"{n}: waiting for the Roblox updater to finish", "warn")
             self.set_status(n, "Waiting for Roblox updater..."); time.sleep(1)
         self.set_status(n, "Getting ticket...")
         ticket = auth_ticket(dec(a["cookie"]))
-        before = set(roblox_windows())
+        before, bp = set(roblox_windows()), roblox_pids()
         os.startfile(launch_uri(ticket, place, job))
         self.set_status(n, "Starting...")
         for _ in range(90):
             time.sleep(1)
-            if set(roblox_windows()) - before: break
+            if self.fresh(before, bp): break
         else:
             self.set_status(n, "Timed out", RED); return self.log(f"{n}: Roblox window never appeared (timed out)", "bad")
         time.sleep(4)                                        # splash -> game window: take the biggest new window
-        cands = list(set(roblox_windows()) - before)
+        cands = self.fresh(before, bp)
         if not cands:
             self.set_status(n, "Window vanished", RED); return self.log(f"{n}: window vanished right after starting", "bad")
-        self.windows[n] = max(cands, key=win_area)
+        hw = max(cands, key=win_area)
+        self.log(f"{n}: launched", "ok")
+        self.after(0, lambda: self.adopt(n, hw, place, job))
+        time.sleep(self.cfg["delay"])
+
+    def fresh(self, before, bp):
+        """New windows of THIS launch: unseen before, not already managed (a docked window hidden on another tab would
+        look new and get claimed twice), and owned by a new Roblox process when processes can be told apart."""
+        mine = set(self.windows.values()); used = {pid_of(h) for h in mine}
+        ws = [h for h in roblox_windows() if h not in before and h not in mine and pid_of(h) not in used]
+        new = roblox_pids() - bp
+        return [h for h in ws if pid_of(h) in new] if new else ws
+
+    def adopt(self, n, hw, place, job):
+        """Main thread only: register a new window, then tile (retile replaces self.windows, so workers must not write it)."""
+        if hw in self.windows.values() or not user32.IsWindow(hw):
+            return self.log(f"{n}: window was already taken - launch not adopted, press Launch again", "bad")
+        self.windows[n] = hw; self.apid[n] = pid_of(hw)
         self.hung[n] = self.missing[n] = self.offline[n] = 0
         self.started[n] = time.time(); self.launch_info[n] = (place, job)
         if n in self.cfg["idle_prio"]: self.set_priority(n, 0x40)
-        self.log(f"{n}: launched", "ok", status=False)
-        self.after(0, self.retile)
-        time.sleep(self.cfg["delay"])
+        self.retile()
 
     def kill_instance(self, n, status="Closed"):
         hw = self.windows.pop(n, None)
@@ -988,7 +1103,7 @@ class App(ctk.CTk):
         self.disconnected.discard(n)
         r = self.rows.get(n)
         if r:
-            put(r, "st", status, MUTED); put(r, "cpu", ""); put(r, "ram", "")
+            put(r, "st", status, MUTED); put(r, "cpu", ""); put(r, "ram", ""); put(r, "gpu", "")
 
     def close_selected(self):
         names = [n for n in self.checked() if n in self.windows]
@@ -1009,7 +1124,7 @@ class App(ctk.CTk):
 
     def rejoin(self, names):
         """Close the instance (if any) and start it again in the same game."""
-        default = (parse_place(self.cfg["place"]), self.cfg["job"])
+        default = (parse_place(self.cfg["place"]), "")
         for n in names:
             a = self.account(n)
             if not a: continue
@@ -1039,7 +1154,7 @@ class App(ctk.CTk):
                 nxt = time.time() + max(30, self.cfg["watch_sec"])
                 self.check_presence(list(self.windows))
             except Exception as ex:
-                self.log(f"Connection watch error: {str(ex)[:70]}", "warn", status=False)
+                self.log(f"Connection watch error: {str(ex)[:70]}", "warn")
 
     def on_presence(self, n, kind):
         if n not in self.windows: return
@@ -1102,9 +1217,12 @@ class App(ctk.CTk):
     def retile(self):
         order = self.cfg["view_order"]
         self.windows = dict(sorted(self.windows.items(), key=lambda kv: order.index(kv[0]) if kv[0] in order else len(order)))
-        self.collect(); wins = self.live(); self.sync_empty()
+        self.collect(); wins = self.live(); self.sync_empty(); self.sync_fs()
         if not wins: self.placeholder(None); return
-        if self.tv.get() != "Viewer": self.tv.set("Viewer")
+        if self.tv.get() != "Viewer":
+            if any(h not in EMBEDDED for h in wins): self.tv.set("Viewer")          # new windows must be embedded now
+            else: self._dirty = True; return                                       # hidden stage: lay out when it is shown
+        self._dirty = False
         self.update_idletasks(); self.fixes.clear()
         if self.maxed in wins:                               # one instance fills the viewer, the rest are hidden
             self.placeholder(None); W, H = self.stage_size()
@@ -1112,7 +1230,6 @@ class App(ctk.CTk):
                 if hw == self.maxed: self.place(hw, (0, 0, W, H))
                 else: self.cell_for(hw).place_forget()
             self.stage.update_idletasks()
-            self.say("Maximized - 'Re-layout' in the Viewer tab brings the tiles back")
             self.after(30, self.update_badges); self.after(60, lambda h=self.maxed: self.give_focus(h))
             return
         if self.active is None: self.active = wins[0]
@@ -1128,9 +1245,9 @@ class App(ctk.CTk):
         extra = tuple(sorted(h for h in roblox_windows() if h not in wins))
         if extra and extra != getattr(self, "_extra", ()):
             self.log("Roblox window(s) open but not managed by Better RAM (pid " + ", ".join(str(pid_of(h)) for h in extra) +
-                     ") - leftover from an earlier session? Close them, they cannot be placed in the viewer", "warn", status=False)
+                     ") - leftover from an earlier session? Close them, they cannot be placed in the viewer", "warn")
         self._extra = extra
-        self.layout_msg = msg; self.say(msg); self.after(30, self.update_badges); self.set_active_label()
+        self.layout_msg = msg; self.after(30, self.update_badges); self.set_active_label()
 
     def place(self, hw, rect):
         x, y, w, h = rect
@@ -1161,6 +1278,16 @@ class App(ctk.CTk):
             tk.Label(inner, text="Focused", bg=CARD, fg=MUTED, font=("Segoe UI", 9)).place(relx=0.5, rely=0.4, anchor="center")
             self.ph_name = tk.Label(inner, bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 11))
             self.ph_name.place(relx=0.5, rely=0.6, anchor="center")
+            self.ph_press = None                             # press-and-drag the placeholder onto a tile = switch with it
+            def down(e): self.ph_press = (e.x_root, e.y_root)
+            def move(e):
+                if self.ph_press and (self.drag or abs(e.x_root - self.ph_press[0]) + abs(e.y_root - self.ph_press[1]) > 8):
+                    self.drag_tile(self.ph_name.cget("text"), e)
+            def up(e):
+                if self.drag: self.drop_tile(self.ph_name.cget("text"), e)
+                self.ph_press = None
+            for w in (self.ph, inner, *inner.winfo_children()):
+                w.configure(cursor="hand2"); w.bind("<Button-1>", down); w.bind("<B1-Motion>", move); w.bind("<ButtonRelease-1>", up)
         x, y, w, h = rect
         self.ph.place(x=x, y=y, width=w, height=h)
         if self.ph.rgn != (w, h): self.ph.rgn = (w, h); round_region(self.ph.winfo_id(), w, h, RADIUS)
@@ -1177,8 +1304,12 @@ class App(ctk.CTk):
             self.cells[hw] = cell
         return cell
 
-    # ---------- drag a tile's name tag onto another tile to reorder ----------
+    # ---------- drag a tile's name tag onto another tile to reorder / onto the Focused tile to switch ----------
     def tile_at(self, x, y, exclude):
+        ph = self.ph                                         # the "Focused" placeholder is a drop target too (switch focus)
+        if ph is not None and ph.winfo_ismapped() and exclude != self.active and \
+                ph.winfo_rootx() <= x < ph.winfo_rootx() + ph.winfo_width() and ph.winfo_rooty() <= y < ph.winfo_rooty() + ph.winfo_height():
+            return "PH"
         for hw, c in self.cells.items():
             if hw == exclude or hw in DOCKED or not c.winfo_ismapped(): continue
             if c.winfo_rootx() <= x < c.winfo_rootx() + c.winfo_width() and c.winfo_rooty() <= y < c.winfo_rooty() + c.winfo_height():
@@ -1193,18 +1324,29 @@ class App(ctk.CTk):
         d["ghost"].tkraise()
         t = self.tile_at(e.x_root, e.y_root, d["hw"])
         if t != d["target"]:
-            if d["target"] in self.cells: self.cells[d["target"]].configure(bg=BTN_H)
-            if t: self.cells[t].configure(bg=TXT)                # highlighted border = drop target
+            self.mark_target(d["target"], False)
+            if t: self.mark_target(t, True)                      # highlighted border = drop target
             d["target"] = t
+
+    def mark_target(self, t, on):
+        w = self.ph if t == "PH" else self.cells.get(t)
+        if w is not None: w.configure(bg=TXT if on else BTN_H)
 
     def drop_tile(self, n, e):
         d, self.drag = self.drag, None
         if not d: return
-        d["ghost"].destroy()
-        if d["target"] in self.cells: self.cells[d["target"]].configure(bg=BTN_H)
-        dst = next((k for k, h in self.windows.items() if h == d["target"]), None)
+        d["ghost"].destroy(); self.mark_target(d["target"], False)
+        f = next((k for k, h in self.windows.items() if h == self.active), None)         # focused account
+        dst = f if d["target"] == "PH" else next((k for k, h in self.windows.items() if h == d["target"]), None)
         if dst is None or dst == n: return
-        names = list(self.windows); names.insert(names.index(dst), names.pop(names.index(n)))
+        names = list(self.windows)
+        if f in (n, dst):                                    # dropped on / dragged from the Focused tile: swap places and focus
+            i, j = names.index(n), names.index(dst); names[i], names[j] = names[j], names[i]
+            self.cfg["view_order"] = names + [x for x in self.cfg["view_order"] if x not in names]
+            self.active = self.windows[n if dst == f else dst]
+            self.retile(); self.after(50, lambda h=self.active: self.give_focus(h)); self.after(150, self.verify_layout)
+            return
+        names.insert(names.index(dst), names.pop(names.index(n)))
         self.cfg["view_order"] = names + [x for x in self.cfg["view_order"] if x not in names]
         self.retile()
 
@@ -1227,7 +1369,7 @@ class App(ctk.CTk):
         fresh = hw not in DOCKED
         dock_window(hw, self.top_hwnd(), sx, sy, w, h, raise_=fresh)
         self.last_dock = (sx, sy, w, h)
-        if fresh: self.after(60, lambda: self.give_focus(hw)); self.fade_in(hw)
+        if fresh: self.after(60, lambda: self.give_focus(hw)); self.after(120, lambda: self.kick(hw, True))
         self.set_active_label()
 
     def undock(self, hw, cell):
@@ -1240,14 +1382,13 @@ class App(ctk.CTk):
             if user32.IsWindow(hw) and hw in DOCKED and not self.modal: user32.SetForegroundWindow(hw)
         except Exception: pass
 
-    def fade_in(self, hw, a=0):
-        """Short alpha ramp for a newly focused window; the layered flag is removed again at the end (no runtime cost)."""
-        if hw not in DOCKED or not user32.IsWindow(hw): return
-        a += 32
-        if a < 255:
-            user32.SetLayeredWindowAttributes(hw, 0, a, LWA_ALPHA); self.after(20, lambda: self.fade_in(hw, a))
-        else:
-            user32.SetWindowLongPtrW(hw, GWL_EXSTYLE, user32.GetWindowLongPtrW(hw, GWL_EXSTYLE) & ~WS_EX_LAYERED)
+    def kick(self, hw, grow):
+        """A re-docked game surface can stay gray until its size changes (exactly what a manual resize does):
+        grow it by 1 px, then restore the real size 60 ms later so the swapchain re-creates and repaints."""
+        if hw != self.active or hw not in DOCKED or not user32.IsWindow(hw) or not self.last_dock: return
+        x, y, w, h = self.last_dock; d = 1 if grow else 0
+        user32.SetWindowPos(hw, 0, x, y, w + d, h + d, SWP_NOZORDER | SWP_NOACTIVATE)
+        if grow: self.after(60, lambda: self.kick(hw, False))
 
     def set_active_label(self):
         name = next((n for n, h in self.windows.items() if h == self.active), None)
@@ -1270,13 +1411,17 @@ class App(ctk.CTk):
         if self.maxed: self.maxed = None; self.retile()
         self.tv.set("Viewer"); self.switch_to(hw)
 
-    def max_instance(self, n):
-        hw = self.windows.get(n)
-        if not hw or not user32.IsWindow(hw): return self.say(f"{n} is not running")
-        self.maxed = self.active = hw; self.retile()
+    def fullscreen(self):
+        """One button: the focused instance fills the viewer; press again to bring the tiles back."""
+        if self.maxed: self.maxed = None
+        elif self.live() and self.active: self.maxed = self.active
+        else: return self.say("No instance running")
+        self.retile()
 
-    def unmax(self): self.maxed = None; self.retile()
-    def toggle_max(self): self.state("normal" if self.state() == "zoomed" else "zoomed")
+    def sync_fs(self):
+        t = "Exit fullscreen" if self.maxed else "Fullscreen"
+        if self.fs.cget("text") != t: self.fs.configure(text=t)
+
     def pick_size(self, choice):                             # only fills the fields; "Apply" commits them
         w, h = choice.split("x"); self.v["windowWidth"].set(w); self.v["windowHeight"].set(h)
 
@@ -1289,7 +1434,7 @@ class App(ctk.CTk):
         return n, raw
 
     def apply_layout(self, size=False, pane=False, other=False):
-        """Commit layout entries (they are not used before) and re-tile; every step is confirmed in the Log tab."""
+        """Commit layout entries (they are not used before) and re-tile; every step is confirmed in the log."""
         if other:
             self.collect(); self.log(f"Launch delay {self.cfg['delay']} s, username badges {'on' if self.cfg['badges'] else 'off'}")
         if size:
@@ -1305,7 +1450,8 @@ class App(ctk.CTk):
             else: self.log(f"Tile area set to {n}% of viewer width" + (f" (you typed {raw}, allowed 20-70)" if n != raw else ""))
         if not self.live(): return self.log("No Roblox windows open - the layout is used as soon as they start")
         self.layout_msg = ""; self.retile()
-        self.log(self.layout_msg or "Saved - an instance is maximized, press Re-layout in the Viewer tab to see it")
+        self.log(self.layout_msg or ("Saved - applied when you open the Viewer tab" if self._dirty
+                 else "Saved - fullscreen is on, 'Exit fullscreen' in the Viewer tab brings the tiles back"))
 
     def on_resize(self, e):
         """Every customtkinter widget redraws on each step of a window drag (slow). Hide the content while the size is
@@ -1325,7 +1471,7 @@ class App(ctk.CTk):
 
     def end_resize(self):
         self._rz = None
-        self.tv.pack(fill="both", expand=True, padx=14, pady=(14, 4), before=self.status_lbl)
+        self.tv.pack(fill="both", expand=True, padx=14, pady=14)
         self.update_idletasks(); self.sizing = False
         self.after(50, self.settle)
 
@@ -1338,10 +1484,9 @@ class App(ctk.CTk):
         for sf in (self.list, self.afk_list):
             try: sf._fit_frame_dimensions_to_canvas(None)
             except Exception: pass
-        self.afk_grid = None; self.fit_afk(); self.on_stage()
+        self.on_stage()
 
     def on_stage(self, _=None):
-        self.fit_afk()
         if self._relayout: self.after_cancel(self._relayout)
         self._relayout = self.after(200, self._do_relayout)
 
@@ -1374,6 +1519,7 @@ class App(ctk.CTk):
         if fg and fg == self.top_hwnd() and not self.app_fg_top and self._tab == "Viewer" and self.active in DOCKED:
             self.after(120, lambda h=self.active: self.give_focus(h))     # tabbed back in -> hand focus to the game
         self.app_fg_top = bool(fg and fg == self.top_hwnd()); self._tab = self.tv.get()
+        if self._dirty and self._tab == "Viewer": self._dirty = False; self.after(60, self.retile)
         self.after(40 if self._tab == "Viewer" and self.cells else 200, self.poll)
 
     def track_dock(self):
@@ -1387,9 +1533,19 @@ class App(ctk.CTk):
                 else:
                     x, y, w, h = self.dock_local
                     want = (self.stage.winfo_rootx() + x, self.stage.winfo_rooty() + y, w, h)
-                    if want != self.last_dock or not user32.IsWindowVisible(hw):
+                    r = win_rect(hw)
+                    bad = (user32.GetWindowLongPtrW(hw, GWL_STYLE) & WS_CAPTION == WS_CAPTION or user32.GetWindowLongPtrW(hw, GWL_STYLE) & WS_THICKFRAME) or \
+                          max(abs(r.left - want[0]), abs(r.top - want[1]), abs(r.right - r.left - w), abs(r.bottom - r.top - h)) > 2
+                    if bad and self.dock_fix < 25:           # Roblox put its frame/size back (e.g. while still starting): dock it again
+                        if not self.dock_fix: self.log("Focused window left its pane - re-docking", "warn")
+                        self.dock_fix += 1
+                        _restyle(hw, WS_POPUP | WS_VISIBLE, WS_EX_TOOLWINDOW)
+                        user32.SetWindowPos(hw, 0, *want, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED)
+                        self.last_dock = want; self.after(80, lambda h=hw: self.kick(h, True))
+                    elif want != self.last_dock or not user32.IsWindowVisible(hw):
                         user32.SetWindowPos(hw, 0, *want, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW)
                         self.last_dock = want
+                    if not bad: self.dock_fix = 0
         finally:
             self.after(80, self.track_dock)
 
@@ -1403,7 +1559,8 @@ class App(ctk.CTk):
             if not user32.IsWindow(hw) or not cell.winfo_ismapped(): continue
             ch = cell.winfo_id(); w, h = cell.winfo_width(), cell.winfo_height()
             st = user32.GetWindowLongPtrW(hw, GWL_STYLE) & 0xFFFFFFFF
-            if user32.GetParent(hw) != ch or not (st & WS_CHILD) or (st & (WS_CAPTION | WS_THICKFRAME)):
+            if user32.GetParent(hw) != ch or not (st & WS_CHILD) or (st & (WS_CAPTION | WS_THICKFRAME)) \
+               or user32.GetWindowLongPtrW(hw, GWL_EXSTYLE) & WS_EX_LAYERED:      # stuck at alpha 0 = grey tile
                 embed_window(hw, ch); fit_child(hw, w, h); continue
             r = win_rect(hw)
             if (abs(r.right - r.left - w + 2 * BORDER) > 2 or abs(r.bottom - r.top - h + 2 * BORDER) > 2) and self.fixes.get(hw, 0) < 3:
@@ -1447,14 +1604,16 @@ class App(ctk.CTk):
         except Exception: return None, None
 
     def update_rows(self):
-        run = frozen = disc = crashed = 0; ram = cpu_t = 0.0
+        run = frozen = disc = crashed = 0; ram = cpu_t = gpu_t = 0.0
         for n, hw in list(self.windows.items()):            # gone for 2 checks in a row = crashed / closed
             self.missing[n] = 0 if user32.IsWindow(hw) else self.missing.get(n, 0) + 1
+            if self.missing[n] >= 2 and self.rebind(n, hw): continue
             if self.missing[n] >= 2:
-                self.crashed[n] = time.strftime("%H:%M")
+                self.crashed[n] = time.strftime("%H:%M"); use = self.crash_use[n] = self.last_use.pop(n, None)
                 self.windows.pop(n); self.procs.pop(n, None); self.prev_state.pop(n, None); self.disconnected.discard(n)
                 self.drop_cell(hw)
-                self.log(f"{n}: window disappeared - crashed or closed", "bad")
+                self.log(f"{n}: window disappeared - crashed or closed" +
+                         (f" (last seen: RAM {use[1]:.0f} MB, CPU {use[0]:.0f}%)" if use else ""), "bad")
                 self.sync_empty()
         for a in self.cfg["accounts"]:
             n = a["name"]; r = self.rows.get(n)
@@ -1467,18 +1626,45 @@ class App(ctk.CTk):
                 elif n in self.disconnected: state, text, col = "disc", "Disconnected - not in a game", RED; disc += 1
                 else: state, text, col = "run", "Running", GREEN; run += 1
                 if state != self.prev_state.get(n):
-                    if state == "frozen": self.log(f"{n}: not responding", "warn", status=False)
-                    elif self.prev_state.get(n) == "frozen": self.log(f"{n}: responding again", "ok", status=False)
+                    if state == "frozen": self.log(f"{n}: not responding", "warn")
+                    elif self.prev_state.get(n) == "frozen": self.log(f"{n}: responding again", "ok")
                     self.prev_state[n] = state
-                if cpu is not None: cpu_t += cpu; ram += mb
+                if cpu is not None: cpu_t += cpu; ram += mb; self.last_use[n] = (cpu, mb)
                 put(r, "st", text, col)
                 put(r, "cpu", "n/a" if cpu is None else f"{cpu:.0f}%"); put(r, "ram", "n/a" if mb is None else f"{mb:.0f} MB")
+                g = self.gpu.get(pid_of(hw))
+                put(r, "gpu", "GPU n/a" if self.gpu_ok is False else "GPU -" if self.gpu_ok is None else f"GPU {g or 0:.0f}%")
+                if g: gpu_t += g
             elif n in self.crashed:
                 crashed += 1
-                put(r, "st", f"Crashed / closed ({self.crashed[n]})", RED); put(r, "cpu", "-"); put(r, "ram", "-")
+                u = self.crash_use.get(n)
+                put(r, "st", f"Crashed / closed ({self.crashed[n]})", RED)
+                put(r, "cpu", f"{u[0]:.0f}%" if u else "-"); put(r, "ram", f"{u[1]:.0f} MB" if u else "-"); put(r, "gpu", "")
         txt = (f"Running {run}   Frozen {frozen}   Disconnected {disc}   Crashed {crashed}      "
-                         f"RAM {ram/1024:.1f} GB   CPU {cpu_t:.0f}%")
+                         f"RAM {ram/1024:.1f} GB   CPU {cpu_t:.0f}%" +
+                         ("" if not self.gpu_ok else f"   GPU {min(100, gpu_t):.0f}% (system {self.gpu_total:.0f}%)"))
         if txt != self.summary.get(): self.summary.set(txt)
+
+    def gpu_loop(self):
+        while True:
+            try:
+                time.sleep(1.5 if self.windows else 4)
+                r = gpu_sample()
+                if r is None: self.gpu_ok = False; time.sleep(30); continue      # counters missing (old Windows / no driver)
+                self.gpu, self.gpu_total, self.gpu_ok = r[0], r[1], True
+            except Exception: time.sleep(5)
+
+    def rebind(self, n, old):
+        """Roblox sometimes replaces its window (same process, new handle): follow it instead of calling it a crash."""
+        mine = set(self.windows.values())
+        ws = [h for h in roblox_windows() if h not in mine and pid_of(h) == self.apid.get(n)]
+        if not ws: return False
+        new = max(ws, key=win_area)
+        self.drop_cell(old); self.windows[n] = new; self.missing[n] = 0
+        if self.active == old: self.active = new
+        if self.maxed == old: self.maxed = new
+        self.log(f"{n}: Roblox replaced its window - following it", "warn"); self.retile()
+        return True
 
     def refresh_status(self):
         """Re-check every account now: clear stale crash notes, redraw usage, ask Roblox who is really in a game."""
@@ -1489,13 +1675,13 @@ class App(ctk.CTk):
             if r and a["name"] not in self.windows:
                 bad = self.cookie_ok.get(a["name"]) is False
                 put(r, "st", "Cookie expired - re-login" if bad else "Idle", RED if bad else MUTED); put(r, "cpu", ""); put(r, "ram", "")
-        self.update_rows(); self.say("Refreshing status...")
+        self.update_rows()
         threading.Thread(target=self._refresh_presence, daemon=True).start()
 
     def _refresh_presence(self):
         try: self.check_presence(list(self.windows))
-        except Exception as ex: self.log(f"Status refresh error: {str(ex)[:70]}", "warn", status=False)
-        self.after(1500, self.update_rows); self.after(1500, lambda: self.say("Status refreshed"))
+        except Exception as ex: self.log(f"Status refresh error: {str(ex)[:70]}", "warn")
+        self.after(1500, self.update_rows)
 
     def dash(self):
         try: self.update_rows()
@@ -1513,7 +1699,7 @@ class App(ctk.CTk):
     def set_idle_prio(self, n, on):
         s = set(self.cfg["idle_prio"]); (s.add if on else s.discard)(n)
         self.cfg["idle_prio"] = sorted(s); self.set_priority(n, self.prio_class(n))
-        self.log(f"{n}: lowest priority {'on' if on else 'off'}", status=False)
+        self.log(f"{n}: lowest priority {'on' if on else 'off'}")
 
     def do_trim(self):
         ok = blocked = 0
@@ -1542,7 +1728,7 @@ class App(ctk.CTk):
         user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)                      # creates this thread's message queue
         self.hk_tid = kernel32.GetCurrentThreadId()
         bad = [f"Ctrl+Shift+{name}" for i, vk, name in self.HK_KEYS if not user32.RegisterHotKey(None, i, 0x4006, vk)]
-        if bad: self.log("Hotkeys unavailable (used by another program): " + ", ".join(bad), "warn", status=False)
+        if bad: self.log("Hotkeys unavailable (used by another program): " + ", ".join(bad), "warn")
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == 0x0312: self.after(0, lambda i=int(msg.wParam): self.hotkey(i))
         for i, _, _ in self.HK_KEYS: user32.UnregisterHotKey(None, i)
@@ -1586,7 +1772,7 @@ class App(ctk.CTk):
             steps += [(700, lambda h=hw: self.switch_to(h)), (900, lambda h=hw: self.afk_aim(h)),
                       (300, self.afk_down), (150, self.afk_up), (gap, self.afk_down), (150, self.afk_up)]
         steps.append((600, self.afk_finish))
-        self.log(f"Anti-AFK round started ({len(wins)} instances)", status=False)
+        self.log(f"Anti-AFK round started ({len(wins)} instances)")
         self.run_seq(steps)
 
     def afk_aim(self, hw):
@@ -1622,7 +1808,7 @@ class App(ctk.CTk):
                 if self.cfg["afk"] and now >= self.afk_next:
                     self.afk_next = now + max(1, self.cfg["afk_min"]) * 60; self.after(0, self.start_afk)
             except Exception as ex:
-                self.log(f"Maintenance error: {str(ex)[:60]}", "warn", status=False)
+                self.log(f"Maintenance error: {str(ex)[:60]}", "warn")
 
     # ---------- self-update ----------
     def check_update_now(self):
@@ -1653,7 +1839,7 @@ class App(ctk.CTk):
             self.log(f"Update v{new} installed - restart to use it", "ok")
             self.after(0, lambda: self.offer_restart(new))
         except Exception as ex:
-            self.log(f"Update check failed: {str(ex)[:80]}", "warn", status=manual)
+            self.log(f"Update check failed: {str(ex)[:80]}", "warn")
 
     def offer_restart(self, new):
         n = len(self.live())
@@ -1664,7 +1850,7 @@ class App(ctk.CTk):
     def restart(self):
         self.save()
         subprocess.Popen([sys.executable, os.path.abspath(__file__)], creationflags=0x00000008)   # DETACHED_PROCESS
-        self.log("Restarting for update", status=False); self.hotkeys(False); self.unembed_all(); self.destroy()
+        self.log("Restarting for update"); self.hotkeys(False); self.unembed_all(); self.destroy()
 
     # ---------- exit ----------
     def on_exit(self):
@@ -1678,7 +1864,7 @@ class App(ctk.CTk):
             if ans is None: return
             if ans:
                 for hw in list(self.windows.values()): kill_pid(pid_of(hw))
-        self.save(); self.log("Better RAM closed", status=False)
+        self.save(); self.log("Better RAM closed")
         self.hotkeys(False); self.unembed_all(); self.destroy()
 
 if __name__ == "__main__":
