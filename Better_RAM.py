@@ -47,8 +47,19 @@ Uses the same accounts file (%APPDATA%\\AltManager.json) as every earlier versio
 #       no focus change, no tab switching, all accounts at once; Settings > Anti-AFK and Macros tab 'Background input').
 #       Visual macro builder (Macros tab > Visual builder): see-through, non-activating overlay over the focused window with numbered,
 #       draggable widgets per step + floating panel with [+] / [-], reorder, undo, test and named macro slots (save / load)
+#  v43  Builder and recorder are ONE feature (the Record button is gone): three non-activating layers - numbered step widgets over the focused
+#       window, the numbered step list over the tile area, all buttons over the Anti-AFK strip - that follow the app with the docked window's
+#       timing (track_dock); recording is a mode of the builder. Macro per account (list on the Macros screen, cfg macro_map) replaces 'Run on';
+#       New / Save / the text editor are gone; Run forever; End = panic button (also the macro hotkey while something runs); the macro hotkey is
+#       three pickers (modifier / modifier / key, '_' = blank). Discord: custom alert text, custom commands (answered by polling the channel),
+#       setup tutorial link. Removed dead code: system GPU total, parse_macro / fmt_step, the old recorder
+#  v44  Log: the same warning at most once per 30 s, re-dock warning once a minute, the log no longer jumps to the bottom while you scroll.
+#       Builder layers hide while another program is in front. Anti-AFK always runs in the background (posted clicks: no cursor, no focus, works
+#       minimized / on any tab / during a macro; own job slot + per-window input lock; real-mouse round removed). Smooth builder circles and
+#       swipe lines (sprite). Key step and Change read a real key press (capture). Macro hotkey key = button + searchable list (confirm choices).
+#       Recorder reads the real mouse and keys (rec_poll), the game stays clickable while recording.
 # =====================================================================================================================
-import atexit, base64, ctypes, ctypes.wintypes as wt, json, os, random, re, shutil, socket, stat, struct, subprocess, sys, tempfile, threading, time
+import atexit, base64, ctypes, ctypes.wintypes as wt, json, os, random, re, shutil, socket, stat, struct, subprocess, sys, tempfile, threading, time, webbrowser
 import tkinter as tk
 from tkinter import messagebox
 from urllib.parse import quote
@@ -64,8 +75,9 @@ except Exception: pass
 try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("BetterRAM.App")   # own taskbar identity -> own icon
 except Exception: pass
 
-VERSION = 42                       # bump this in the file you publish; running copies update when it is higher
+VERSION = 49                       # bump this in the file you publish; running copies update when it is higher
 UPDATE_URL = "https://raw.githubusercontent.com/br0dax457-droid/Better-RAM/main/Better_RAM.py"   # built-in update link
+DC_TUTORIAL = "https://docs.discord.com/developers/quick-start/getting-started"   # Discord's own guide: create the app + bot, copy the token, install it (added v43)
 
 # ======================= dependencies: install what's missing, re-check weekly =======================
 DEPS = {"customtkinter": "customtkinter", "requests": "requests", "psutil": "psutil", "playwright": "playwright"}   # module -> pip name
@@ -143,17 +155,19 @@ TXT, MUTED, GREEN, ORANGE, RED = "#ececee", "#8a8d96", "#5fd38d", "#f0a030", "#f
 
 DEFAULTS = {"accounts": [], "games": [], "place": "", "delay": 6,
             "pane": 38, "micro": False, "windowWidth": 320, "windowHeight": 240, "badges": True,
-            "gfx": True, "fps": 15, "quality": 1, "mute": True,
+            "gfx": True, "gfx_lock": True, "hideui": True, "bare": True, "fps": 15, "quality": 1, "mute": True,
             "trim": True, "trim_sec": 90, "lowprio": True,
             "afk": False, "afk_min": 8, "afk_off": 8, "afk_gap": 1200,
             "watch": True, "watch_sec": 60, "auto_rejoin": False, "afk_skip": [], "idle_prio": [], "view_order": [],
             "update_url": "", "auto_update": True, "hotkeys": True, "compact": False, "perf": False,
             "join_mode": "game", "join_user": "", "users": [],
             "anim": True, "animMs": 160,
-            "macros": {}, "macro_sel": "", "macro_target": "Focused account", "macro_loops": 1, "macro_key": "ctrl+alt+m",
-            "dc_on": False, "dc_chan": "", "dc_token": "",
+            "macros": {}, "macro_sel": "", "macro_map": {}, "macro_loops": 1, "macro_forever": False, "macro_key": "ctrl+alt+m",
+            "dc_on": False, "dc_chan": "", "dc_token": "", "dc_fmt": "[Better RAM] {msg}", "dc_cmd_on": False, "dc_prefix": "!",
+            "dc_cmds": [["status", "Running {running}/{total} - frozen {frozen}, disconnected {disc}, crashed {crashed}"],
+                        ["accounts", "Running: {accounts}"], ["help", "Commands: {commands}"]],
             "afk_bg": False, "macro_bg": False, "bg_wake": True}
-STR_KEYS = {"place", "update_url", "join_user", "dc_chan", "macro_key"}
+STR_KEYS = {"place", "update_url", "join_user", "dc_chan", "dc_fmt", "dc_prefix"}
 USER_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 
 # ======================= GPU usage (Windows "GPU Engine" performance counters) =======================
@@ -173,7 +187,7 @@ def _pdh_array(pdh, counter):
     return [(items[i].name or "", items[i].val.CStatus, items[i].val.d) for i in range(cnt.value)]
 
 def gpu_sample(wait=1.0):
-    """-> ({pid: gpu %}, total gpu %, {pid: dedicated VRAM bytes} or None) or None when the counters are unavailable."""
+    """-> ({pid: gpu %}, {pid: dedicated VRAM bytes} or None) or None when the counters are unavailable."""
     try:
         pdh = ctypes.windll.pdh
         pdh.PdhOpenQueryW.argtypes = [ctypes.c_wchar_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)]
@@ -190,14 +204,13 @@ def gpu_sample(wait=1.0):
             pdh.PdhCollectQueryData(q); time.sleep(wait); pdh.PdhCollectQueryData(q)
             rows = _pdh_array(pdh, c)
             if rows is None: return None
-            per, tot = {}, {}
+            per = {}
             for name, status, val in rows:
                 m = _GPU_RE.search(name)
                 if not m or status not in (0, 1): continue
                 pid, adapter, eng = int(m.group(1)), (m.group(2), m.group(3)), m.group(4).lower()
                 v = max(0.0, val)
                 per[(pid, adapter, eng)] = per.get((pid, adapter, eng), 0.0) + v
-                tot[(adapter, eng)] = tot.get((adapter, eng), 0.0) + v
             by_pid = {}
             for (pid, _, _), v in per.items(): by_pid[pid] = max(by_pid.get(pid, 0.0), v)
             vram = None
@@ -208,7 +221,7 @@ def gpu_sample(wait=1.0):
                     for name, status, val in mem:
                         m = re.search(r"pid_(\d+)_", name)
                         if m and status in (0, 1): vram[int(m.group(1))] = vram.get(int(m.group(1)), 0.0) + max(0.0, val)
-            return {p: min(100.0, v) for p, v in by_pid.items()}, min(100.0, max(tot.values(), default=0.0)), vram
+            return {p: min(100.0, v) for p, v in by_pid.items()}, vram
         finally: pdh.PdhCloseQuery(q)
     except Exception: return None
 
@@ -399,22 +412,42 @@ SKELETON = ('<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" '
 def unlock_settings():
     if os.path.exists(SETTINGS): os.chmod(SETTINGS, stat.S_IREAD | stat.S_IWRITE)
 
-# Writes FPS cap, quality level and mute into Roblox's settings file, then locks it read-only so Roblox can't reset it (v28 or earlier).
-def apply_graphics(fps, quality, mute):
+# Sets only the few keys it needs (FPS cap, quality, mute, window frame, leaderboard/chat closed) and leaves every other line of Roblox's
+# settings file exactly as it is: same line endings, no rewrite when nothing changes, one-time backup (.bak). Optionally read-only after.
+# Optional extras for "bare bones": switched off/quiet only when Roblox already wrote the key (never invented) (added v48).
+BARE = [("bool", "ChatTranslationEnabled", "false"), ("bool", "BadgeVisible", "false"), ("bool", "PlayerNamesEnabled", "false"),
+        ("bool", "VignetteEnabled", "false"), ("bool", "VignetteEnabledCustomOption", "false"), ("bool", "ReducedMotion", "true"),
+        ("bool", "AllTutorialsDisabled", "true"), ("bool", "UiNavigationKeyBindEnabled", "false"), ("float", "HapticStrength", "0"),
+        ("bool", "PerformanceStatsVisible", "false"), ("bool", "OnScreenProfilerEnabled", "false"),
+        ("bool", "MicroProfilerWebServerEnabled", "false"), ("bool", "MaxQualityEnabled", "false")]
+BARE_MUTE = [("float", "PartyVoiceVolume", "0"), ("float", "VoiceChatVolume", "0")]
+
+def apply_graphics(fps, quality, mute, lock=True, hide_ui=True, bare=False):
     os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
     if os.path.exists(SETTINGS):
-        unlock_settings(); xml = open(SETTINGS, encoding="utf-8").read()
+        unlock_settings()
+        with open(SETTINGS, encoding="utf-8", newline="") as fh: old = xml = fh.read()
+        bak = SETTINGS + ".bak"
+        if "UserGameSettings" in old and not os.path.exists(bak):
+            try: shutil.copyfile(SETTINGS, bak)
+            except Exception: pass
     else:
-        xml = SKELETON
+        old, xml = None, SKELETON
     wanted = [("int", "FramerateCap", fps), ("int", "GraphicsQualityLevel", quality),
               ("token", "SavedQualityLevel", quality), ("bool", "Fullscreen", "false"), ("bool", "StartMaximized", "false")]
     if mute: wanted.append(("float", "MasterVolume", "0"))
+    if hide_ui: wanted += [("bool", "PlayerListVisible", "false"), ("bool", "ChatVisible", "false")]
+    if bare:
+        for tag, name, val in BARE + (BARE_MUTE if mute else []):
+            if re.search(rf'<(?:token|int|float|bool)\s+name="{name}">', xml): wanted.append((tag, name, val))
     for tag, name, val in wanted:
         pat = rf'(<(?:token|int|float|bool)\s+name="{name}">)[^<]*(</)'
-        if re.search(pat, xml): xml = re.sub(pat, lambda m: m.group(1) + str(val) + m.group(2), xml)
+        if re.search(pat, xml): xml = re.sub(pat, lambda m: m.group(1) + str(val) + m.group(2), xml, count=1)
         else: xml = xml.replace("</Properties>", f'<{tag} name="{name}">{val}</{tag}></Properties>', 1)
-    open(SETTINGS, "w", encoding="utf-8").write(xml)
-    os.chmod(SETTINGS, stat.S_IREAD)                    # read-only so Roblox can't overwrite it
+    if xml != old:                                       # untouched file stays byte-for-byte the same
+        with open(SETTINGS, "w", encoding="utf-8", newline="") as fh: fh.write(xml)
+    # read-only is the default (every launched instance rewrites this file); turn it off only to let Roblox save window state
+    os.chmod(SETTINGS, stat.S_IREAD if lock else stat.S_IREAD | stat.S_IWRITE)
 
 # ======================= Windows helpers =======================
 GWL_STYLE, GWL_EXSTYLE, GWLP_HWNDPARENT = -16, -20, -8
@@ -572,37 +605,29 @@ def hotkey_spec(text):
     if not vks: return None
     bits = {0x11: 2, 0x10: 4, 0x12: 1, 0x5B: 8}
     main = [v for v in vks if v not in bits]
-    return (sum(bits[v] for v in vks if v in bits), main[0]) if len(main) == 1 else None
+    return (sum({bits[v] for v in vks if v in bits}), main[0]) if len(main) == 1 else None
 
-# One macro step as a text line, e.g. ['swipe', .2, .8, .8, .2, 400] -> 'swipe 0.2 0.8 0.8 0.2 400' (added v41).
-def fmt_step(st): return " ".join(str(v) for v in st)
+# Virtual-key code -> key name of every key the builder can record: a-z, 0-9, F1-F24 and the named keys of KEYMAP (canonical name first) (added v43).
+REC_KEYS = {**{ord(c.upper()): c for c in "abcdefghijklmnopqrstuvwxyz0123456789"}, **{0x6F + i: f"f{i}" for i in range(1, 25)},
+            **{v: k for k, v in reversed(list(KEYMAP.items())) if v not in MODS}}
 
-# Macro text (one step per line, '#' comments) -> (steps, error text). Positions are fractions 0-1 of the window (added v41).
-def parse_macro(text):
-    steps = []
-    for no, raw in enumerate(text.splitlines(), 1):
-        a = raw.split("#")[0].split()
-        if not a: continue
-        t, a = a[0].lower(), a[1:]
-        try:
-            if t == "wait" and len(a) == 1: st = [t, int(a[0])]; ok = 0 <= st[1] <= 600000
-            elif t == "key" and len(a) == 1: st = [t, a[0].lower()]; ok = parse_combo(a[0]) is not None
-            elif t in ("click", "hold", "swipe"):
-                n = {"click": 2, "hold": 3, "swipe": 5}[t]; extra = t != "swipe"
-                btn = a[n].lower() if extra and len(a) == n + 1 else "left"
-                if len(a) not in ((n, n + 1) if extra else (n,)) or btn not in ("left", "right"): raise ValueError
-                v = [float(x) for x in a[:n]]; pos = v[:4] if t == "swipe" else v[:2]
-                ms = 0 if t == "click" else int(v[-1])
-                ok = all(0 <= x <= 1 for x in pos) and 0 <= ms <= 60000
-                st = [t, *v[:4], ms] if t == "swipe" else [t, v[0], v[1], ms, btn] if t == "hold" else [t, v[0], v[1], btn]
-            else: raise ValueError
-            if not ok: raise ValueError
-        except ValueError:
-            return None, (f"Line {no}: can't read '{raw.strip()}'.\nUse: click x y | hold x y ms | swipe x1 y1 x2 y2 ms | key ctrl+a | wait ms\n"
-                          "(x and y between 0 and 1)")
-        steps.append(st)
-    if len(steps) > 500: return None, "A macro can have at most 500 steps."
-    return steps, ""
+# Modifier virtual-key code -> name, and every key the builder can capture or record.
+MOD_NAMES = {0x11: "ctrl", 0x10: "shift", 0x12: "alt", 0x5B: "win"}
+CAP_KEYS = {**REC_KEYS, **MOD_NAMES}
+
+# Choices of the macro hotkey pickers: the first two boxes hold a modifier or '_' (blank), the third box the key (added v43).
+HK_MODS = ["_", "ctrl", "shift", "alt", "win"]
+HK_PICK = [*"abcdefghijklmnopqrstuvwxyz0123456789", *[f"f{i}" for i in range(1, 13)], "space", "enter", "tab", "esc", "backspace", "delete",
+           "insert", "home", "end", "pageup", "pagedown", "left", "up", "right", "down"]
+
+# 'ctrl+alt+m' -> ['ctrl', 'alt', 'm']; 'k' -> ['_', '_', 'k'] ('_' = blank picker); at most two modifiers are shown (added v43).
+def hotkey_parts(text):
+    parts = [p.strip().lower() for p in text.split("+") if p.strip()]
+    mods = [p for p in parts[:-1] if p in HK_MODS][:2]
+    return mods + ["_"] * (2 - len(mods)) + [parts[-1] if parts else "f8"]
+
+# Replaces {name} placeholders in a text from a dict; an unknown placeholder stays as typed (added v43).
+def fill(text, vals): return re.sub(r"\{(\w+)\}", lambda m: str(vals.get(m.group(1), m.group(0))), text)
 
 # ======================= Background input (added v42) =======================
 # Posted window messages reach a game window without moving the real cursor and without taking focus, so the window can be an
@@ -646,43 +671,67 @@ def bg_click(hw, x, y, stop, right=False, hold=0.06):
     bg_mouse(hw, down, x, y, mk); stop.wait(hold)
     bg_mouse(hw, up, x, y, 0); stop.wait(0.03)
 
-# Plays macro steps (the Macros-tab format) on one window with posted messages only; runs in a worker thread and never touches Tk.
-# on_step(i) is called before each step; wake = send the fake activation while the window is not in front; a pressed button or key
-# is always released at the end, also when `stop` is set or the window disappears (added v42).
+INPUT_LOCKS, WAKES, WAKE_LOCK = {}, {}, threading.Lock()
+
+def input_lock(hw):
+    """One lock per game window: a click, swipe or key press is never mixed with the one of another job (macro + Anti-AFK)."""
+    return INPUT_LOCKS.setdefault(hw, threading.Lock())
+
+def wake_count(hw, d):
+    """Counts the jobs that told a window it is active (+1 / -1) and returns the new count, so the last job to finish undoes it."""
+    with WAKE_LOCK:
+        n = WAKES.get(hw, 0) + d
+        if n > 0: WAKES[hw] = n
+        else: WAKES.pop(hw, None)
+        return max(n, 0)
+
+def bg_step(hw, st, stop):
+    """Plays ONE macro step on a window with posted messages. A pause does not hold the window's input lock; everything else does.
+    Whatever it pressed is released again, also when `stop` is set Split out of bg_play."""
+    t = st[0]
+    if t == "wait": stop.wait(st[1] / 1000); return
+    with input_lock(hw):
+        if t == "key":
+            vks = parse_combo(st[1]) or []; keys = [v for v in vks if v in MODS] + [v for v in vks if v not in MODS]
+            try:
+                for v in keys: bg_key(hw, v, False)
+                stop.wait(0.08)
+            finally:
+                for v in reversed(keys): bg_key(hw, v, True)
+            stop.wait(0.05)
+        elif t == "swipe":
+            x1, y1 = bg_pt(hw, st[1], st[2]); x2, y2 = bg_pt(hw, st[3], st[4]); ms = st[5]; k = max(2, min(40, ms // 25)); at = (x1, y1)
+            bg_mouse(hw, WM_MOUSEMOVE, x1, y1); stop.wait(0.03)
+            bg_mouse(hw, WM_LBUTTONDOWN, x1, y1, 1)
+            try:
+                for j in range(1, k + 1):
+                    stop.wait(ms / 1000 / k)
+                    if stop.is_set(): break
+                    at = (x1 + (x2 - x1) * j // k, y1 + (y2 - y1) * j // k); bg_mouse(hw, WM_MOUSEMOVE, at[0], at[1], 1)
+            finally: bg_mouse(hw, WM_LBUTTONUP, at[0], at[1], 0)
+            stop.wait(0.04)
+        else:
+            x, y = bg_pt(hw, st[1], st[2])
+            bg_click(hw, x, y, stop, st[-1] == "right", max(0.06, st[3] / 1000) if t == "hold" else 0.06)
+
+# Plays macro steps (the builder's format) on one window with posted messages only; runs in a worker thread and never touches Tk.
+# on_step(i) is called before each step; wake = send the fake activation while the window is not in front; loops=None repeats until `stop`
+# is set (added v42; changed v43: loops=None = run forever; changed v44: steps run in bg_step, the fake activation is counted so a macro and
+# Anti-AFK can use the same window at the same time).
 def bg_play(hw, steps, stop, wake=True, loops=1, on_step=None):
     woke = wake and user32.GetForegroundWindow() != hw
-    if woke: bg_wake(hw, True)
-    held, keys = None, []
+    if woke and wake_count(hw, 1) == 1: bg_wake(hw, True)
     try:
-        for _ in range(loops):
+        n = 0
+        while loops is None or n < loops:
+            n += 1
             for i, st in enumerate(steps):
                 if stop.is_set() or not user32.IsWindow(hw): return
                 if on_step: on_step(i)
-                t = st[0]
-                if t == "wait": stop.wait(st[1] / 1000)
-                elif t == "key":
-                    vks = parse_combo(st[1]) or []
-                    keys = [v for v in vks if v in MODS] + [v for v in vks if v not in MODS]
-                    for v in keys: bg_key(hw, v, False)
-                    stop.wait(0.08)
-                    for v in reversed(keys): bg_key(hw, v, True)
-                    keys = []; stop.wait(0.05)
-                elif t == "swipe":
-                    x1, y1 = bg_pt(hw, st[1], st[2]); x2, y2 = bg_pt(hw, st[3], st[4]); ms = st[5]; n = max(2, min(40, ms // 25))
-                    bg_mouse(hw, WM_MOUSEMOVE, x1, y1); stop.wait(0.03)
-                    bg_mouse(hw, WM_LBUTTONDOWN, x1, y1, 1); held = (x1, y1)
-                    for k in range(1, n + 1):
-                        stop.wait(ms / 1000 / n)
-                        if stop.is_set(): break
-                        held = (x1 + (x2 - x1) * k // n, y1 + (y2 - y1) * k // n); bg_mouse(hw, WM_MOUSEMOVE, held[0], held[1], 1)
-                    bg_mouse(hw, WM_LBUTTONUP, held[0], held[1], 0); held = None; stop.wait(0.04)
-                else:
-                    x, y = bg_pt(hw, st[1], st[2])
-                    bg_click(hw, x, y, stop, st[-1] == "right", max(0.06, st[3] / 1000) if t == "hold" else 0.06)
+                bg_step(hw, st, stop)
+            if stop.wait(0.05): return                       # also keeps a forever loop of zero-length steps from spinning
     finally:
-        for v in reversed(keys): bg_key(hw, v, True)
-        if held and user32.IsWindow(hw): bg_mouse(hw, WM_LBUTTONUP, held[0], held[1], 0)
-        if woke and user32.IsWindow(hw) and user32.GetForegroundWindow() != hw: bg_wake(hw, False)
+        if woke and wake_count(hw, -1) == 0 and user32.IsWindow(hw) and user32.GetForegroundWindow() != hw: bg_wake(hw, False)
 
 # Makes a Tk top-level window non-activating: clicking it never takes the keyboard focus from the game or any other program (added v42).
 def no_activate(win):
@@ -691,30 +740,77 @@ def no_activate(win):
     user32.SetWindowLongPtrW(hw, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
     user32.SetWindowPos(hw, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
 
-# ======================= Visual macro builder (added v42) =======================
-# Two floating windows that never take focus: a see-through layer exactly over the focused game window that carries one numbered,
-# draggable widget per click / hold / swipe step (the colour key makes empty areas click-through, so the game stays usable), and a
-# small control panel with the step list, [+] / [-], reorder, undo, named macro slots and a Test button. Positions are stored as
-# fractions of the window, exactly like the Macros tab, so a macro built here runs on any account. It follows the focused account.
+SPRITES, LINES, RIM = {}, {}, "#0c1322"
+
+def sprite(d, fill, edge, ew, ring=False):
+    """Smooth filled circle for the builder as a Tk image: drawn 4x bigger and shrunk (anti-aliased), with a dark 2 px rim - the rim is
+    nearly the see-through colour, so the soft edge blends away instead of showing a halo - and a faint top gloss. d = size in px,
+    ew = outline width, ring = white inner ring (hold step). Cached per look."""
+    key = (d, fill, edge, ew, ring)
+    if key not in SPRITES:
+        from PIL import Image, ImageDraw, ImageTk
+        S = 4; big = d * S; rim = 2 * S; e = rim + ew * S
+        im = Image.new("RGBA", (big, big), (0, 0, 0, 0)); dr = ImageDraw.Draw(im)
+        dr.ellipse((0, 0, big - 1, big - 1), fill=RIM)
+        dr.ellipse((rim, rim, big - 1 - rim, big - 1 - rim), fill=edge)
+        if big - 1 - e > e: dr.ellipse((e, e, big - 1 - e, big - 1 - e), fill=fill)
+        if ring: r = (d // 2 - 9) * S; c = big // 2; dr.ellipse((c - r, c - r, c + r, c + r), outline="#ffffff", width=2 * S)
+        gl = Image.new("RGBA", (big, big), (0, 0, 0, 0)); ImageDraw.Draw(gl).ellipse((big * .2, e, big * .8, big * .52), fill=(255, 255, 255, 38))
+        im = Image.alpha_composite(im, gl).resize((d, d), Image.LANCZOS)
+        SPRITES[key] = ImageTk.PhotoImage(Image.alpha_composite(Image.new("RGBA", (d, d), (1, 2, 3, 255)), im).convert("RGB"))
+    return SPRITES[key]
+
+def line_sprite(dx, dy, col, w=8):
+    """Smooth rounded line (with the same dark rim) from (0, 0) to (dx, dy) as one Tk image -> (image, (ox, oy)): put it at the start point minus
+    (ox, oy), anchor nw. Cached; the cache is emptied when it grows (lines change while a swipe is dragged)."""
+    key = (dx, dy, col, w)
+    if key not in LINES:
+        from PIL import Image, ImageDraw, ImageTk
+        if len(LINES) > 40: LINES.clear()
+        pad = w + 4; W, H = abs(dx) + 2 * pad, abs(dy) + 2 * pad; S = 3 if W * H < 600000 else 1
+        a = (pad if dx >= 0 else W - pad, pad if dy >= 0 else H - pad); b = (a[0] + dx, a[1] + dy)
+        im = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0)); dr = ImageDraw.Draw(im)
+        for width, c in ((w + 4, RIM), (w, col)):
+            r = width * S / 2; p, q = (a[0] * S, a[1] * S), (b[0] * S, b[1] * S)
+            dr.line([p, q], fill=c, width=int(width * S))
+            for x, y in (p, q): dr.ellipse((x - r, y - r, x + r, y + r), fill=c)
+        im = im.resize((W, H), Image.LANCZOS)
+        LINES[key] = (ImageTk.PhotoImage(Image.alpha_composite(Image.new("RGBA", (W, H), (1, 2, 3, 255)), im).convert("RGB")), a)
+    return LINES[key]
+
+# ======================= Visual macro builder (added v42; v43: merged with the recorder, three layers) =======================
+# One feature, three floating windows that never take focus. App.track_dock calls follow(), so they follow the app with the same timing
+# as the docked focused window (200 ms idle, 10 ms while the manager is being moved):
+#   ov  see-through layer exactly over the focused game window: one numbered, draggable widget per click / hold / swipe step; it catches the
+#       mouse only while a step is being placed or recorded (colour key = empty areas are click-through, the game stays usable)
+#   ls  layer over the tile area (the unfocused accounts): the numbered list of every step in order, same numbers as on the focused window
+#   st  layer over the Anti-AFK strip of the Viewer: all buttons ([+] [-] up / down, undo, record, test, load / save, input mode, ...)
+# Positions are fractions of the window, so a macro built here runs on any account. Recording (click, hold, swipe, keys / combos, pauses
+# -> wait steps) is a mode of the builder; recorded steps are the same numbered widgets. All layers hide while the Viewer is not showing,
+# the manager is minimized or an in-app prompt is open, and are destroyed when the builder closes.
 class MacroBuilder:
     KEY = "#010203"                                         # colour key: pixels of this colour are see-through AND click-through
     COL = {"click": "#3b8ee8", "hold": "#f0a030", "swipe": "#5fd38d"}
     R = 20                                                  # widget radius (px)
-    HINT = "Drag a circle to move it  -  right-click a circle to delete it"
+    HINT = "Drag a circle to move it  -  right-click it to delete"
 
-    # Creates the overlay and the panel over the focused window and shows the given macro; sets app.builder (added v42).
+    # Creates the three layers over the focused window and shows the given macro; sets app.builder (added v42; changed v43: three layers).
     def __init__(self, app, name, steps):
         app.builder = self
         self.app, self.name = app, name
         self.steps, self.hist = json.loads(json.dumps(steps)), []
-        self.hw, self.rect, self.ov, self.pn = app.active, None, None, None
-        self.sel = self.arm = self.run_i = self.pstart = self.dragging = None
-        self.hits, self.alive, self.shown, self.hidden = [], True, True, False
-        self.dirty = self.running = self.moved = False
-        self.job, self.poff = None, (0, 0)
+        self.hw, self.rect = app.active, None
+        self.sel = self.arm = self.run_i = self.pstart = self.dragging = self.pick = self.rec_job = None
+        self.hits, self.layers, self.rects, self.shown, self.last_err = [], {}, {}, {}, ""
+        self.alive, self.hidden, self.ov_off = True, False, False
+        self.dirty = self.running = self.moved = self.rec = False
+        self.rec_last, self.rec_down = 0.0, set()
+        self.gone = 0.0                                     # since when another program has been in front (0 = none)
+        self.cap = self.cap_job = None                      # key capture in progress
+        self.rec_btn = set()                                # mouse buttons that were down at the last recording tick
         fg = user32.GetForegroundWindow()
-        self.mk_overlay(); self.mk_panel()
-        for w in (self.ov, self.pn): w.update_idletasks(); no_activate(w)
+        self.mk_overlay(); self.mk_steps(); self.mk_bar()
+        for w in self.layers.values(): w.update_idletasks(); no_activate(w)
         if fg and user32.GetForegroundWindow() != fg: user32.SetForegroundWindow(fg)     # creating a window must not steal focus
         self.refresh(); self.follow()
 
@@ -728,111 +824,131 @@ class MacroBuilder:
         if not self.hw or not user32.IsWindow(self.hw): return None
         w, h = client_size(self.hw); x, y = client_origin(self.hw); return x, y, w, h
 
-    # Creates the see-through, semi-transparent canvas window exactly over the target's client area (added v42).
+    def in_front(self):
+        """True while the manager, the focused game window or one of these layers is the window in front."""
+        fg = user32.GetForegroundWindow()
+        if not fg: return False
+        top = self.app.top_hwnd()
+        return fg in {top, self.hw, *(user32.GetAncestor(w.winfo_id(), 2) for w in self.layers.values())} or user32.GetAncestor(fg, 3) == top
+
+    def away(self):
+        """True once another program has been in front for 0.3 s: the layers must not float over it."""
+        if self.in_front(): self.gone = 0.0; return False
+        self.gone = self.gone or time.time()
+        return time.time() - self.gone > 0.3
+
+    # Screen rectangle (x, y, w, h) of each layer that should be showing: the focused window's client area, the tile area (only when
+    # there is one: 2+ running accounts) and the Anti-AFK strip. A layer that must hide is missing from the result;
+    # force = ignore the hide rules (used while the layers are created) (added v43; changed v44: hidden while another program is in front).
+    def layout(self, live, force=False):
+        app = self.app
+        if not force and (self.hidden or app.modal or app.state() == "iconic" or app.tv.get() != "Viewer" or self.away()): return {}
+        out = {}
+        m = self.measure() if self.hw in live and user32.IsWindowVisible(self.hw) and not app.unfocused else None
+        if m and m[2] > 40 and m[3] > 40 and not self.ov_off: out["ov"] = m
+        tw = app.dock_local[0] if app.dock_local and not app.unfocused else 0   # the focused window starts where the tile area ends
+        if tw >= 150: out["ls"] = (app.stage.winfo_rootx(), app.stage.winfo_rooty(), tw, app.stage.winfo_height())
+        b = app.sbar; out["st"] = (b.winfo_rootx(), b.winfo_rooty(), b.winfo_width(), b.winfo_height())
+        return out
+
+    # Creates one borderless, topmost, semi-transparent window at its current layout rectangle (added v43).
+    def mk_layer(self, key, bg, alpha):
+        r = self.layout(self.app.live(), True).get(key) or (0, 0, 300, 120)
+        w = self.layers[key] = tk.Toplevel(self.app); w.overrideredirect(True); w.attributes("-topmost", True); w.attributes("-alpha", alpha)
+        w.configure(bg=bg); w.geometry(f"{r[2]}x{r[3]}+{r[0]}+{r[1]}"); self.rects[key] = r
+        return w
+
+    # Creates the see-through canvas layer over the focused window (added v42; changed v43: made by mk_layer).
     def mk_overlay(self):
-        x, y, w, h = self.rect = self.measure()
-        ov = self.ov = tk.Toplevel(self.app); ov.overrideredirect(True); ov.attributes("-topmost", True)
-        ov.attributes("-alpha", 0.65); ov.attributes("-transparentcolor", self.KEY); ov.configure(bg=self.KEY)
-        ov.geometry(f"{w}x{h}+{x}+{y}")
+        ov = self.mk_layer("ov", self.KEY, 0.93); ov.attributes("-transparentcolor", self.KEY)
         cv = self.cv = tk.Canvas(ov, bg=self.KEY, highlightthickness=0, bd=0); cv.pack(fill="both", expand=True)
         for ev, fn in (("<ButtonPress-1>", self.c_down), ("<ButtonPress-3>", self.c_down), ("<B1-Motion>", self.c_move),
                        ("<ButtonRelease-1>", self.c_up), ("<ButtonRelease-3>", self.c_up)):
             cv.bind(ev, lambda e, f=fn: self.safe(f, e))
 
-    # Small dark button made from a label (works in a window that never gets focus); .on = highlighted state (added v42).
+    # Creates the layer over the tile area: a title and the numbered list of all steps (added v43).
+    def mk_steps(self):
+        ls = self.mk_layer("ls", CARD, 0.95)
+        self.title = tk.Label(ls, text="", bg="#000000", fg=TXT, font=("Segoe UI Semibold", 11), padx=10, pady=6, anchor="w"); self.title.pack(fill="x")
+        lf = tk.Frame(ls, bg=CARD); lf.pack(fill="both", expand=True, padx=8, pady=8)
+        sb = tk.Scrollbar(lf, orient="vertical"); self.lb = self.mk_list(lf, sb); sb.configure(command=self.lb.yview)
+        self.lb.pack(side="left", fill="both", expand=True); sb.pack(side="right", fill="y")
+        self.lb.bind("<<ListboxSelect>>", lambda e: self.safe(self.on_pick))
+
+    # Small dark button made from a label (works in a window that never gets focus); .on = highlighted state in colour .col (added v42).
     def tb(self, parent, text, cmd, pad=8):
-        b = tk.Label(parent, text=text, bg=BTN, fg=TXT, padx=pad, pady=4, cursor="hand2", font=("Segoe UI Semibold", 10)); b.on = False
+        b = tk.Label(parent, text=text, bg=BTN, fg=TXT, padx=pad, pady=4, cursor="hand2", font=("Segoe UI Semibold", 10)); b.on, b.col = False, "#3b8ee8"
         b.bind("<Button-1>", lambda e: self.safe(cmd))
-        b.bind("<Enter>", lambda e: b.configure(bg=BTN_H)); b.bind("<Leave>", lambda e: b.configure(bg="#3b8ee8" if b.on else BTN))
+        b.bind("<Enter>", lambda e: b.configure(bg=BTN_H)); b.bind("<Leave>", lambda e: b.configure(bg=b.col if b.on else BTN))
         return b
 
     # Switches a tb button's highlight on or off (added v42).
-    def lit(self, b, on): b.on = on; b.configure(bg="#3b8ee8" if on else BTN)
+    def lit(self, b, on): b.on = on; b.configure(bg=b.col if on else BTN)
 
-    # Creates the floating control panel: title bar, slot row, step page (list + [+] [-] ...), slot page, test / mode row (added v42).
-    def mk_panel(self):
-        x, y, w, h = self.rect
-        pn = self.pn = tk.Toplevel(self.app); pn.overrideredirect(True); pn.attributes("-topmost", True); pn.attributes("-alpha", 0.96)
-        pn.configure(bg=CARD, highlightthickness=1, highlightbackground=BTN_H); pn.geometry(f"+{max(0, x + w - 350)}+{y + 12}")
-        head = tk.Frame(pn, bg="#000000"); head.pack(fill="x")
-        self.title = tk.Label(head, text="", bg="#000000", fg=TXT, font=("Segoe UI Semibold", 11), padx=10, pady=6, cursor="fleur", anchor="w")
-        self.title.pack(side="left", fill="x", expand=True)
-        x_ = tk.Label(head, text="✕", bg="#000000", fg=TXT, font=("Segoe UI Semibold", 11), padx=10, pady=6, cursor="hand2")
-        x_.pack(side="right"); x_.bind("<Button-1>", lambda e: self.safe(self.close))
-        for wd in (head, self.title): wd.bind("<ButtonPress-1>", self.p_down); wd.bind("<B1-Motion>", self.p_move)
-        row = tk.Frame(pn, bg=CARD); row.pack(fill="x", padx=8, pady=(8, 2))
-        self.slot_lab = tk.Label(row, text="", bg=CARD, fg=TXT, anchor="w", width=15, font=("Segoe UI Semibold", 10)); self.slot_lab.pack(side="left")
-        for t, c in (("Load", self.slots_open), ("Save", self.save), ("Save as", lambda: self.save(True)), ("New", self.new)):
-            self.tb(row, t, c, 6).pack(side="left", padx=2)
-        body = tk.Frame(pn, bg=CARD); body.pack(fill="x")
-        pg = self.pg_steps = tk.Frame(body, bg=CARD); pg.pack(fill="x")
-        self.bar = tk.Frame(pg, bg=CARD); self.bar.pack(fill="x", padx=8, pady=(6, 2))
-        self.b_add = self.tb(self.bar, "+", self.toggle_add, 14); self.b_add.pack(side="left", padx=(0, 2))
-        for t, c in (("−", self.remove), ("▲", lambda: self.move(-1)), ("▼", lambda: self.move(1)), ("Undo", self.undo)):
-            self.tb(self.bar, t, c, 14 if len(t) == 1 else 10).pack(side="left", padx=2)
-        self.add_row, self.add_btns = tk.Frame(pg, bg=CARD), {}
+    # Creates the layer over the Anti-AFK strip: row 1 edit buttons + step properties, row 2 record / test / input mode, row 3 macro slots + hint (added v43).
+    def mk_bar(self):
+        st = self.mk_layer("st", CARD, 0.96); st.configure(highlightthickness=1, highlightbackground=BTN_H)
+        ra, rb, rc = (tk.Frame(st, bg=CARD) for _ in range(3))
+        for r in (ra, rb, rc): r.pack(fill="x", padx=8, pady=3)
+        self.b_add = self.tb(ra, "+", self.toggle_add, 14); self.b_add.pack(side="left", padx=(0, 2))
+        self.add_row, self.add_btns = tk.Frame(ra, bg=CARD), {}
         for k, t in (("click", "Click"), ("hold", "Hold"), ("swipe", "Swipe"), ("key", "Key"), ("wait", "Wait")):
             b = self.tb(self.add_row, t, lambda k=k: self.add(k), 9); b.pack(side="left", padx=2); self.add_btns[k] = b
-        self.hint = tk.Label(pg, text=self.HINT, bg=CARD, fg=MUTED, wraplength=320, justify="left", anchor="w", font=("Segoe UI", 9))
-        self.hint.pack(fill="x", padx=10, pady=(4, 2))
-        lf = tk.Frame(pg, bg=CARD); lf.pack(fill="x", padx=8)
-        sb = tk.Scrollbar(lf, orient="vertical"); self.lb = self.mk_list(lf, sb); sb.configure(command=self.lb.yview)
-        self.lb.pack(side="left", fill="x", expand=True); sb.pack(side="right", fill="y")
-        self.lb.bind("<<ListboxSelect>>", lambda e: self.safe(self.on_pick))
-        self.prop = tk.Frame(pg, bg=CARD, height=34); self.prop.pack(fill="x", padx=8, pady=(4, 2)); self.prop.pack_propagate(False)
+        for t, c in (("−", self.remove), ("▲", lambda: self.move(-1)), ("▼", lambda: self.move(1)), ("Undo", self.undo)):
+            self.tb(ra, t, c, 14 if len(t) == 1 else 10).pack(side="left", padx=2)
+        self.tb(ra, "✕", self.close, 12).pack(side="right")
+        self.prop = tk.Frame(ra, bg=CARD, height=30, width=300); self.prop.pack(side="left", padx=(12, 0)); self.prop.pack_propagate(False)
         self.p_lab = tk.Label(self.prop, bg=CARD, fg=TXT, font=("Segoe UI", 10), anchor="w")
         self.p_dec, self.p_inc = self.tb(self.prop, "−", lambda: self.bump(-1), 12), self.tb(self.prop, "+", lambda: self.bump(1), 12)
         self.p_btn = self.tb(self.prop, "", self.prop_btn)
-        sp = self.pg_slots = tk.Frame(body, bg=CARD)
-        tk.Label(sp, text="Saved macros", bg=CARD, fg=MUTED, anchor="w", font=("Segoe UI", 9)).pack(fill="x", padx=10, pady=(6, 2))
-        self.sl = self.mk_list(sp); self.sl.pack(fill="x", padx=8)
-        r = tk.Frame(sp, bg=CARD); r.pack(fill="x", padx=8, pady=6)
-        for t, c in (("Load", self.slot_load), ("Delete", self.slot_delete), ("Back", self.slots_close)): self.tb(r, t, c).pack(side="left", padx=2)
-        ft = tk.Frame(pn, bg=CARD); ft.pack(fill="x", padx=8, pady=(4, 2))
-        self.tb(ft, "▶ Test", self.test, 12).pack(side="left", padx=(0, 2)); self.tb(ft, "■ Stop", self.stop, 12).pack(side="left", padx=2)
-        f2 = tk.Frame(pn, bg=CARD); f2.pack(fill="x", padx=8, pady=(2, 8))
-        self.b_mode = self.tb(f2, "", self.toggle_mode); self.b_mode.pack(side="left", padx=(0, 2))
-        self.b_tgt = self.tb(f2, "", self.cycle_target); self.b_tgt.pack(side="left", padx=2)
-        self.foot(); pn.update_idletasks(); pn.geometry(f"+{max(0, x + w - pn.winfo_reqwidth() - 12)}+{y + 12}")
+        self.b_rec = self.tb(rb, "● Record", self.toggle_rec, 10); self.b_rec.col = "#d94a4a"; self.b_rec.pack(side="left", padx=(0, 2))
+        self.tb(rb, "▶ Test", self.test, 12).pack(side="left", padx=2); self.tb(rb, "■ Stop", self.stop, 12).pack(side="left", padx=2)
+        self.b_mode = self.tb(rb, "", self.toggle_mode); self.b_mode.pack(side="left", padx=(12, 2))
+        self.b_tgt = self.tb(rb, "", self.assign); self.b_tgt.pack(side="left", padx=2)
+        self.tb(rc, "◀", lambda: self.browse(-1), 8).pack(side="left")
+        self.slot_lab = tk.Label(rc, text="", bg=CARD, fg=TXT, anchor="w", width=16, font=("Segoe UI Semibold", 10)); self.slot_lab.pack(side="left", padx=2)
+        self.tb(rc, "▶", lambda: self.browse(1), 8).pack(side="left", padx=(0, 6))
+        for t, c in (("Load", self.slot_load), ("Save", self.save), ("Save as", lambda: self.save(True)), ("New", self.new), ("Delete", self.slot_delete)):
+            self.tb(rc, t, c, 7).pack(side="left", padx=2)
+        self.hint = tk.Label(rc, text=self.HINT, bg=CARD, fg=MUTED, anchor="w", font=("Segoe UI", 9)); self.hint.pack(side="left", fill="x", expand=True, padx=(10, 0))
 
-    # A dark Listbox that never asks for the keyboard focus (used for the steps and for the saved macros) (added v42).
+    # A dark Listbox that never asks for the keyboard focus (added v42).
     def mk_list(self, parent, sb=None):
         return tk.Listbox(parent, height=9, width=38, bg=FIELD, fg=TXT, selectbackground="#3b8ee8", selectforeground="#ffffff", highlightthickness=0,
                           bd=0, activestyle="none", exportselection=False, takefocus=0, font=("Consolas", 10), yscrollcommand=sb.set if sb else None)
 
-    # Title-bar drag of the panel: remembers where inside the panel the press happened (added v42).
-    def p_down(self, e): self.poff = (e.x_root - self.pn.winfo_x(), e.y_root - self.pn.winfo_y())
+    # Account shown in the focused window, or "" (added v43).
+    def who(self): return next((n for n, h in self.app.windows.items() if h == self.hw), "")
 
-    # Title-bar drag of the panel: moves it with the mouse (added v42).
-    def p_move(self, e): self.pn.geometry(f"+{e.x_root - self.poff[0]}+{e.y_root - self.poff[1]}")
-
-    # Updates the 'Input: ...' and 'On: ...' buttons from the Macros-tab settings (added v42).
+    # Updates the 'Input: ...' and 'Assign to ...' buttons (added v42; changed v43: Assign replaces the 'On:' target).
     def foot(self):
-        a = self.app.cfg; t = a["macro_target"]
-        self.b_mode.configure(text="Input: Background" if a["macro_bg"] else "Input: Real mouse")
-        self.b_tgt.configure(text="On: " + (t if len(t) <= 18 else t[:17] + "…"))
+        who = self.who()
+        self.b_mode.configure(text="Input: Background" if self.app.cfg["macro_bg"] else "Input: Real mouse")
+        self.b_tgt.configure(text=("Assign to " + who)[:26] if who else "Assign")
 
     # Panel button: flips background input for macros (same setting as the checkbox in the Macros tab) (added v42).
     def toggle_mode(self):
         v = not self.app.cfg["macro_bg"]; self.app.cfg["macro_bg"] = v; self.app.v["macro_bg"].set(v); self.foot()
 
-    # Panel button: cycles the 'Run on' target of the Macros tab: focused, all running accounts, or one account (added v42).
-    def cycle_target(self):
-        a = self.app; vals = ["Focused account", "All running accounts"] + [x["name"] for x in a.cfg["accounts"]]
-        cur = a.cfg["macro_target"]; nxt = vals[(vals.index(cur) + 1) % len(vals)] if cur in vals else vals[0]
-        a.cfg["macro_target"] = nxt; a.mg.set(nxt); self.foot()
+    # Assign button: makes the saved macro the macro of the focused account (the same list as on the Macros screen) (added v43).
+    def assign(self):
+        a, who = self.app, self.who()
+        if not who: return
+        if not self.name or self.dirty: return self.set_hint("Save the macro first, then assign it")
+        a.cfg["macro_map"][who] = self.name; a.macro_refresh(); self.set_hint(f"{who} now runs '{self.name}'")
 
-    # Shows a short message under the buttons (added v42).
+    # Shows a short message in the strip (added v42).
     def set_hint(self, text): self.hint.configure(text=text)
 
-    # Redraws everything that depends on the steps: list, overlay widgets, property row, slot name, title (added v42).
+    # Redraws everything that depends on the steps: list, overlay widgets, property row, slot name, buttons, title (added v42).
     def refresh(self):
-        self.fill_list(); self.render(); self.props(); self.slot_text()
-        who = next((n for n, h in self.app.windows.items() if h == self.hw), "")
-        self.title.configure(text=f"Macro builder  -  {who}" if who else "Macro builder")
+        self.fill_list(); self.render(); self.props(); self.slot_text(); self.foot()
+        who = self.who(); self.title.configure(text=f"Macro steps  -  {who}  ({len(self.steps)})" if who else f"Macro steps  ({len(self.steps)})")
 
-    # Shows the current slot name (with * when there are unsaved changes) (added v42).
-    def slot_text(self): self.slot_lab.configure(text=(self.name or "(unsaved)")[:13] + (" *" if self.dirty else ""))
+    # Shows the slot name (* = unsaved changes) or, while browsing with the arrows, the saved macro that Load / Delete will use (added v42).
+    def slot_text(self):
+        t = f"▸ {self.pick}" if self.pick else (self.name or "(unsaved)") + (" *" if self.dirty else "")
+        self.slot_lab.configure(text=t[:16])
 
     # One step as a list line; the number is the step's real position, the same number the widget on screen shows (added v42).
     def describe(self, i):
@@ -865,11 +981,18 @@ class MacroBuilder:
         self.render(); self.props()
 
     # Draws the numbered widgets: circle = click, ringed circle = hold, circle + line + small end circle = swipe; white outline = selected
-    # or currently running; red R = right button. While a placement tool is armed the whole area is tinted so clicks land on it (added v42).
+    # or currently running; red R = right button. While a placement tool is armed or recording, the whole area is tinted so the mouse
+    # lands on it (added v42; changed v43: recording banner; changed v44: smooth circles and swipe lines, see sprite; while recording only a
+    # banner is drawn so the clicks reach the game).
     def render(self):
         if not self.rect: return
-        cv, (x, y, w, h), R = self.cv, self.rect, self.R
+        cv, w, h, R = self.cv, self.rect[2], self.rect[3], self.R
         cv.delete("all"); self.hits = []
+        if self.rec:                                         # only a small banner: everything else stays click-through, the game is played for real
+            bw = min(w - 20, 560); x0 = (w - bw) // 2
+            cv.create_rectangle(x0, 6, x0 + bw, 44, fill="#0b1020", outline="#d94a4a", width=3)
+            cv.create_text(w // 2, 25, fill="#ffffff", font=("Segoe UI Semibold", 12), text="● Recording: play on the game  (press Record again to stop)")
+            return
         if self.arm:
             cv.create_rectangle(0, 0, w, h, fill="#0b1020", outline="#3b8ee8", width=4)
             cv.create_text(w // 2, 26, fill="#ffffff", font=("Segoe UI Semibold", 13),
@@ -882,11 +1005,11 @@ class MacroBuilder:
             edge = "#ffffff" if hot else "#cfe6ff"
             if t == "swipe":
                 qx, qy = st[3] * w, st[4] * h
-                cv.create_line(px, py, qx, qy, fill=col, width=8, capstyle="round")
-                cv.create_oval(qx - 11, qy - 11, qx + 11, qy + 11, fill=col, outline=edge, width=4 if hot else 2)
+                img, o = line_sprite(round(qx - px), round(qy - py), col)
+                cv.create_image(round(px) - o[0], round(py) - o[1], image=img, anchor="nw")
+                cv.create_image(qx, qy, image=sprite(26, col, edge, 3 if hot else 1))
                 self.hits.append((i, "b", qx, qy, 14))
-            cv.create_oval(px - R, py - R, px + R, py + R, fill=col, outline=edge, width=5 if hot else 2)
-            if t == "hold": cv.create_oval(px - R + 7, py - R + 7, px + R - 7, py + R - 7, outline="#ffffff", width=2)
+            cv.create_image(px, py, image=sprite(2 * R + 4, col, edge, 4 if hot else 2, t == "hold"))
             cv.create_text(px, py, text=str(i + 1), fill="#ffffff", font=("Segoe UI Semibold", 13))
             if t != "swipe" and st[-1] == "right": cv.create_text(px + R - 2, py - R + 2, text="R", fill="#ff6b6b", font=("Segoe UI Semibold", 11))
             self.hits.append((i, "a", px, py, R))
@@ -898,38 +1021,35 @@ class MacroBuilder:
     # Undo button: goes back to the previous state of the step list (added v42).
     def undo(self):
         if not self.hist: return self.set_hint("Nothing to undo")
-        self.steps = json.loads(self.hist.pop())
+        self.steps = json.loads(self.hist.pop()); self.rec_last = 0.0
         if self.sel is not None and self.sel >= len(self.steps): self.sel = None
         self.refresh()
 
-    # Inserts a step after the selected one (or at the end), selects it and redraws (added v42).
-    def insert(self, step):
-        if len(self.steps) >= 500: return self.set_hint("A macro can have at most 500 steps.")
+    # Inserts one or more steps after the selected one (or at the end) as ONE undo step, selects the last one and redraws (added v42; changed v43: several steps).
+    def insert(self, *new):
+        if len(self.steps) + len(new) > 500: return self.set_hint("A macro can have at most 500 steps.")
         self.push(); i = self.sel + 1 if self.sel is not None else len(self.steps)
-        self.steps.insert(i, step); self.sel = i; self.refresh()
+        self.steps[i:i] = new; self.sel = i + len(new) - 1; self.refresh()
 
     # [+] button: shows or hides the row with the step types (hiding also stops placing) (added v42).
     def toggle_add(self):
         if self.add_row.winfo_ismapped(): self.add_row.pack_forget(); self.arm = None; self.lit(self.b_add, False)
-        else: self.add_row.pack(fill="x", padx=8, pady=2, after=self.bar); self.lit(self.b_add, True)
+        else: self.add_row.pack(side="left", padx=2, after=self.b_add); self.lit(self.b_add, True)
         self.lit_add(); self.render()
 
     # Highlights the armed step type's button (added v42).
     def lit_add(self):
         for k, b in self.add_btns.items(): self.lit(b, k == self.arm)
-        self.set_hint(f"Click on the game to place a {self.arm}. Placed steps go after the selected one." if self.arm else self.HINT)
+        self.set_hint(f"Click on the game to place a {self.arm}" if self.arm else self.HINT)
 
-    # Step type button: click / hold / swipe arm the placement tool (press again to stop), key asks for the key or combo,
-    # wait adds a 500 ms pause (added v42).
+    # Step type button: click / hold / swipe arm the placement tool (press again to stop), key waits for you to press the key or combo,
+    # wait adds a 500 ms pause (added v42; changed v44: Key reads the real key press instead of asking you to type it).
     def add(self, kind):
+        if self.rec: self.rec_stop()
         if kind == "wait": return self.insert(["wait", 500])
         if kind == "key":
-            combo = self.prompt(self.app.ask, "Key or key combo", "Key or combo to press, e.g. space, f5 or ctrl+shift+a:")
-            if combo is None: return
-            combo = combo.strip().lower()
-            if not parse_combo(combo): return self.prompt(self.app.note, "Key", "That is not a valid key or combo. Use names like space, enter, f5, a, "
-                                                                                 "or combos like ctrl+shift+a (modifiers: ctrl, shift, alt, win).")
-            return self.insert(["key", combo])
+            if self.cap: self.cap = None; return self.lit_add()
+            return self.capture(lambda combo: self.insert(["key", combo]))
         self.arm = None if self.arm == kind else kind
         self.lit_add(); self.render()
 
@@ -955,8 +1075,8 @@ class MacroBuilder:
         if i is None or i >= len(self.steps):
             self.p_lab.configure(text="Select a step to edit it"); self.p_lab.pack(side="left", padx=2); return
         st = self.steps[i]; t = st[0]
-        self.p_lab.configure(text=f"Wait {st[1]} ms" if t == "wait" else f"Hold {st[3]} ms" if t == "hold" else f"Swipe {st[5]} ms" if t == "swipe"
-                             else f"Key {st[1]}" if t == "key" else "Click")
+        self.p_lab.configure(text=f"Wait {st[1]} ms" if t == "wait" else f"Hold {st[3]} ms" if t == "hold" else f"Swipe {st[5]} ms"
+                             if t == "swipe" else f"Key {st[1]}" if t == "key" else "Click")
         self.p_lab.pack(side="left", padx=(2, 6))
         if t in ("wait", "hold", "swipe"): self.p_dec.pack(side="left", padx=2); self.p_inc.pack(side="left", padx=2)
         if t in ("click", "hold"): self.p_btn.configure(text="Right-click" if st[-1] == "right" else "Left-click"); self.p_btn.pack(side="left", padx=(8, 2))
@@ -973,25 +1093,24 @@ class MacroBuilder:
         new = min(hi, max(lo, v + d * step))
         if new != v: self.push(); st[k] = new; self.lb_update(i); self.props()
 
-    # Property row button: toggles left / right click, or changes the key of a key step (added v42).
+    # Property row button: toggles left / right click, or changes the key of a key step (added v42; changed v44: Change reads a key press).
     def prop_btn(self):
         i = self.sel
         if i is None or i >= len(self.steps): return
         st = self.steps[i]
         if st[0] in ("click", "hold"): self.push(); st[-1] = "left" if st[-1] == "right" else "right"; self.refresh()
-        elif st[0] == "key":
-            combo = self.prompt(self.app.ask, "Key or key combo", "Key or combo to press:", default=st[1])
-            if combo and parse_combo(combo.strip().lower()): self.push(); st[1] = combo.strip().lower(); self.refresh()
+        elif st[0] == "key": self.capture(lambda combo, i=i: self.set_key(i, combo), "Press the new key or combo now")
 
-    # Mouse press on the overlay: on a widget = select it and start dragging (right button = delete it); on empty tinted area while a
-    # placement tool is armed = start of a placement (added v42).
+    # Mouse press on the overlay: while recording or placing = start of a gesture; otherwise on a widget = select it and start dragging
+    # (right button = delete it) (added v42; changed v43: recording).
     def c_down(self, e):
-        right = e.num == 3
+        btn = "right" if e.num == 3 else "left"
+        if self.rec: return
         hit = next((h for h in reversed(self.hits) if (e.x - h[2]) ** 2 + (e.y - h[3]) ** 2 <= h[4] ** 2), None)
         if hit:
-            if right: return self.remove(hit[0])
+            if btn == "right": return self.remove(hit[0])
             self.dragging, self.moved = hit, False; return self.select(hit[0])
-        if self.arm: self.pstart = (e.x, e.y, "right" if right else "left")
+        if self.arm: self.pstart = (e.x, e.y, time.time(), btn)
 
     # Mouse move on the overlay: drags the widget (stores fractions of the window live) or shows the swipe rubber band (added v42).
     def c_move(self, e):
@@ -1003,62 +1122,159 @@ class MacroBuilder:
             if part == "b": st[3], st[4] = fx, fy
             else: st[1], st[2] = fx, fy
             self.render(); self.lb_update(i)
-        elif self.arm == "swipe" and self.pstart:
+        elif self.arm == "swipe" and self.pstart and self.pstart[3] == "left":
             self.cv.delete("rb"); self.cv.create_line(self.pstart[0], self.pstart[1], e.x, e.y, fill="#5fd38d", width=8, capstyle="round", tags="rb")
 
-    # Mouse release on the overlay: ends a drag, or turns the placement gesture into a click / hold / swipe step (added v42).
+    # Mouse release on the overlay: ends a drag, or turns the gesture into a step by the armed tool (click / hold / swipe)
+    # (added v42; changed v43: recording; changed v44: recording no longer goes through here, see rec_poll).
     def c_up(self, e):
         if self.dragging: self.dragging = None; return
         if not (self.arm and self.pstart): return
-        x0, y0, btn = self.pstart; self.pstart = None; self.cv.delete("rb")
+        x0, y0, t0, btn = self.pstart; self.pstart = None; self.cv.delete("rb")
         w, h = self.rect[2], self.rect[3]; f = lambda v, m: round(min(max(v / m, 0), 1), 4)
+        far, ms = (e.x - x0) ** 2 + (e.y - y0) ** 2 >= 196, int((time.time() - t0) * 1000)
         if self.arm == "swipe":
-            if (e.x - x0) ** 2 + (e.y - y0) ** 2 < 196: return self.set_hint("Swipe: press at the start and drag to the end")
+            if not far: return self.set_hint("Swipe: press at the start, drag to the end")
             self.insert(["swipe", f(x0, w), f(y0, h), f(e.x, w), f(e.y, h), 400])
         elif self.arm == "hold": self.insert(["hold", f(x0, w), f(y0, h), 1000, btn])
         else: self.insert(["click", f(x0, w), f(y0, h), btn])
 
-    # Runs an in-app prompt (ask / confirm / note) from the builder: both floating windows are hidden meanwhile and the manager gets the
-    # keyboard, because the prompt is drawn inside the manager window (added v42).
+    # Record button: starts / stops recording. You play on the game as usual: the real mouse (click, hold 0.5 s+, drag = swipe) and every key or
+    # combo typed while the game or the manager is in front are recorded; pauses of 0.3 s or more become wait steps
+    # (added v43; replaces the old Record button; changed v44: reads the real mouse and keys, the game stays clickable).
+    def toggle_rec(self):
+        if self.rec: return self.rec_stop()
+        if self.running: return
+        self.arm = self.cap = None; self.lit_add(); self.rec, self.rec_last, self.rec_down = True, 0.0, self.keys_down()
+        self.rec_btn, self.pstart = self.mouse_down(), None            # a button that is already down does not start a gesture
+        self.lit(self.b_rec, True); self.set_hint("Recording - play on the game: click, hold, drag, type keys"); self.render()
+        self.app.give_focus(self.hw); self.rec_poll()
+
+    # Stops recording (added v43).
+    def rec_stop(self):
+        self.rec, self.pstart = False, None; self.lit(self.b_rec, False); self.set_hint(self.HINT); self.render()
+        if self.rec_job:
+            try: self.app.after_cancel(self.rec_job)
+            except Exception: pass
+            self.rec_job = None
+
+    # Virtual-key codes of the recordable keys that are down right now (added v43).
+    def keys_down(self): return {vk for vk in REC_KEYS if user32.GetAsyncKeyState(vk) & 0x8000}
+
+    # Recording: adds one recorded step; a pause of 0.3 s or more since the previous action is added first as a wait step (added v43).
+    def rec_add(self, step, t0):
+        gap = t0 - self.rec_last
+        self.insert(*([["wait", min(60000, round(gap * 20) * 50)], step] if self.rec_last and gap >= 0.3 else [step]))
+        self.rec_last = time.time()
+
+    def mouse_down(self):
+        """Mouse buttons that are down right now: a subset of {'left', 'right'}."""
+        return {b for b, vk in (("left", 1), ("right", 2)) if user32.GetAsyncKeyState(vk) & 0x8000}
+
+    def rec_poll(self):
+        """Recording: every 15 ms reads the REAL mouse buttons, cursor and keys from Windows (nothing depends on a window getting focus or events).
+        A press inside the game area followed by its release becomes click / hold (left 0.5 s+) / swipe (moved 14+ px); a new non-modifier key, with
+        the Ctrl / Shift / Alt / Win that are held, becomes a key step. Only counts while the game or the manager is in front, and the macro
+        hotkey itself is not recorded. Runs only while recording (added v43 as a key poll; changed v44: mouse too)."""
+        self.rec_job = None
+        if not (self.alive and self.rec): return
+        try:
+            front = self.in_front() and not self.hidden and bool(self.shown.get("ov")); rc = self.rect
+            pt = wt.POINT(); user32.GetCursorPos(ctypes.byref(pt)); down = self.mouse_down(); new, self.rec_btn = down - self.rec_btn, down
+            if self.pstart is None:
+                if new and front and rc and rc[0] <= pt.x < rc[0] + rc[2] and rc[1] <= pt.y < rc[1] + rc[3]:
+                    self.pstart = (pt.x, pt.y, time.time(), "left" if "left" in new else "right")
+            elif self.pstart[3] not in down:                       # released: turn the gesture into a step
+                x0, y0, t0, btn = self.pstart; self.pstart = None
+                if rc:
+                    f = lambda v, o, m: round(min(max((v - o) / max(m, 1), 0), 1), 4)
+                    far, ms = (pt.x - x0) ** 2 + (pt.y - y0) ** 2 >= 196, int((time.time() - t0) * 1000)
+                    if btn == "left" and far: st = ["swipe", f(x0, rc[0], rc[2]), f(y0, rc[1], rc[3]), f(pt.x, rc[0], rc[2]), f(pt.y, rc[1], rc[3]), max(100, min(3000, round(ms / 50) * 50))]
+                    elif btn == "left" and ms >= 500: st = ["hold", f(x0, rc[0], rc[2]), f(y0, rc[1], rc[3]), min(60000, round(ms / 50) * 50), "left"]
+                    else: st = ["click", f(x0, rc[0], rc[2]), f(y0, rc[1], rc[3]), btn]
+                    self.rec_add(st, t0)
+            keys = self.keys_down(); newk, self.rec_down = keys - self.rec_down, keys
+            if newk and front:
+                mods = [n for vk, n in MOD_NAMES.items() if user32.GetAsyncKeyState(vk) & 0x8000]
+                for vk in sorted(newk):
+                    combo = "+".join(mods + [REC_KEYS[vk]])
+                    if combo != self.app.cfg["macro_key"]: self.rec_add(["key", combo], time.time())
+        except Exception as ex:
+            self.app.log(f"Builder: recording stopped ({str(ex)[:60]})", "warn"); return self.rec_stop()
+        self.rec_job = self.app.after(15, self.rec_poll)
+
+    def capture(self, done, hint="Press the key or combo now  (Key again = cancel)"):
+        """Reads the next key press from Windows (the layers never take the keyboard): hold Ctrl / Shift / Alt / Win and press a key, or press
+        a single key; it ends when everything is released. done(combo) gets e.g. 'f5' or 'ctrl+shift+a'. Gives up after 10 s."""
+        if self.rec: self.rec_stop()
+        self.cap = {"done": done, "order": [], "t0": time.time(), "base": {vk for vk in CAP_KEYS if user32.GetAsyncKeyState(vk) & 0x8000}}
+        self.arm = None; self.lit_add(); self.set_hint(hint); self.lit(self.add_btns["key"], True)
+        if not self.cap_job: self.cap_poll()
+
+    def cap_poll(self):
+        """Every 20 ms: collects the keys that went down since the capture started; when all are released the combo is handed over."""
+        self.cap_job = None; c = self.cap
+        if not (self.alive and c): return
+        down = {vk for vk in CAP_KEYS if user32.GetAsyncKeyState(vk) & 0x8000} - c["base"]
+        c["order"] += sorted(down - set(c["order"]))
+        if c["order"] and not down:
+            order = c["order"]; self.cap = None; self.lit_add()
+            combo = "+".join([n for vk, n in MOD_NAMES.items() if vk in order] + [REC_KEYS[vk] for vk in order if vk in REC_KEYS][:1])
+            return c["done"](combo)
+        if time.time() - c["t0"] > 10: self.cap = None; self.lit_add(); return self.set_hint("No key pressed - cancelled")
+        self.cap_job = self.app.after(20, self.cap_poll)
+
+    def set_key(self, i, combo):
+        """Capture result for the Change button: puts the new key into step i."""
+        if i < len(self.steps) and self.steps[i][0] == "key": self.push(); self.steps[i][1] = combo; self.refresh()
+
+    # Runs an in-app prompt (ask / confirm / note) from the builder: all layers hide meanwhile and the manager gets the keyboard, because the
+    # prompt is drawn inside the manager window (added v42; changed v43: layers come back at once).
     def prompt(self, fn, *a, **k):
-        self.hidden = True; self.vis(False)
+        self.hidden = True; self.hide_all()
         try:
             user32.SetForegroundWindow(self.app.top_hwnd())
             return fn(*a, **k)
         finally:
-            self.hidden = False
+            self.hidden = False; self.follow()
 
-    # Shows or hides both windows without activating them (ShowWindow SW_SHOWNOACTIVATE / SW_HIDE) (added v42).
-    def vis(self, on):
-        self.shown = on
-        for w in (self.ov, self.pn):
-            if w is not None: user32.ShowWindow(user32.GetAncestor(w.winfo_id(), 2), 4 if on else 0)
+    # Shows or hides one layer without activating it (ShowWindow SW_SHOWNOACTIVATE / SW_HIDE) and only when its state changes (added v43).
+    def show(self, key, on):
+        if self.shown.get(key) == on: return
+        self.shown[key] = on; user32.ShowWindow(user32.GetAncestor(self.layers[key].winfo_id(), 2), 4 if on else 0)
 
-    # Re-shows both windows on top of everything, without activating them (builder button pressed again) (added v42).
+    # Hides every layer (added v43).
+    def hide_all(self):
+        for k in self.layers: self.show(k, False)
+
+    # Re-shows the layers on top of everything, without activating them (builder button pressed again) (added v42).
     def front(self):
-        self.hidden = False; self.vis(True)
-        for w in (self.ov, self.pn): user32.SetWindowPos(user32.GetAncestor(w.winfo_id(), 2), -1, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        self.hidden = False
+        for w in self.layers.values(): user32.SetWindowPos(user32.GetAncestor(w.winfo_id(), 2), -1, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        self.follow()
 
-    # Every 150 ms: follows the focused account, keeps the overlay exactly over its client area, hides both windows while the Viewer is
-    # not showing / the manager is minimized / a prompt is open, and re-shows them afterwards (added v42).
+    # Called by App.track_dock with the docked window's timing (200 ms idle, 10 ms while the manager moves): follows the focused account, puts
+    # every layer exactly over its area (geometry is only touched when the rectangle changed) and hides them all while the Viewer is not
+    # showing / the manager is minimized / a prompt is open (added v42 as a 150 ms timer; changed v43: driven by track_dock, three layers).
     def follow(self):
         if not self.alive: return
         app = self.app
         try:
             live = app.live()
             if app.active in live and app.active != self.hw and not self.running:
-                self.hw, self.rect = app.active, None; self.refresh()
-            m = self.measure() if self.hw in live else None
-            ok = bool(m and m[2] > 40 and m[3] > 40 and not self.hidden and not app.modal and app.state() != "iconic"
-                      and app.tv.get() == "Viewer" and user32.IsWindowVisible(self.hw))
-            if ok:
-                if m != self.rect: self.rect = m; self.ov.geometry(f"{m[2]}x{m[3]}+{m[0]}+{m[1]}"); self.render()
-                if not self.shown: self.vis(True)
-            elif self.shown: self.vis(False)
-        except Exception as ex: app.log(f"Builder error: {str(ex)[:80]}", "warn")
-        self.job = app.after(150, self.follow)
+                self.hw = app.active; self.refresh()
+            want = self.layout(live)
+            for k, w in self.layers.items():
+                r = want.get(k)
+                if r is None: self.show(k, False); continue
+                if r != self.rects.get(k): self.rects[k] = r; w.geometry(f"{r[2]}x{r[3]}+{r[0]}+{r[1]}")
+                if k == "ov" and r != self.rect: self.rect = r; self.render()
+                self.show(k, True)
+        except Exception as ex:
+            msg = str(ex)[:80]
+            if msg != self.last_err: self.last_err = msg; app.log(f"Builder error: {msg}", "warn")
 
-    # Save / Save as: stores the steps under a name in the same macro list as the Macros tab (asks for the name in-app) (added v42).
+    # Save / Save as: stores the steps under a name in the same macro list as the Macros screen (asks for the name in-app) (added v42).
     def save(self, as_new=False):
         a = self.app
         if not self.steps: return self.set_hint("Nothing to save yet - add some steps")
@@ -1070,54 +1286,47 @@ class MacroBuilder:
             if name in a.cfg["macros"] and name != self.name and self.prompt(
                     a.confirm, "Replace macro", f"A macro named '{name}' already exists. Replace it?", [("Replace", True), ("Cancel", None)]) is not True: return
         a.cfg["macros"][name] = json.loads(json.dumps(self.steps)); a.cfg["macro_sel"] = name
-        self.name, self.dirty = name, False; a.macro_refresh(); self.slot_text(); self.set_hint(f"Saved '{name}' ({len(self.steps)} steps)")
+        self.name, self.dirty, self.pick = name, False, None; a.macro_refresh(); self.slot_text(); self.set_hint(f"Saved '{name}' ({len(self.steps)} steps)")
         a.log(f"Macro '{name}' saved from the visual builder ({len(self.steps)} steps)", "ok")
 
     # New button: empties the editor (Undo brings the old steps back) (added v42).
     def new(self):
-        self.push(); self.steps, self.name, self.sel, self.arm = [], "", None, None; self.lit_add(); self.refresh()
+        self.push(); self.steps, self.name, self.sel, self.arm, self.pick = [], "", None, None, None; self.lit_add(); self.refresh()
 
-    # Load button: shows the list of saved macro slots instead of the step page (added v42).
-    def slots_open(self):
+    # Arrow buttons: browse the saved macros; the one shown is what Load / Delete use (added v43; replaces the slot list page).
+    def browse(self, d):
         names = list(self.app.cfg["macros"])
         if not names: return self.set_hint("No saved macros yet - build one and press Save")
-        self.sl.delete(0, "end")
-        for n in names: self.sl.insert("end", n)
-        if self.name in names: self.sl.select_set(names.index(self.name))
-        self.pg_steps.pack_forget(); self.pg_slots.pack(fill="x")
+        cur = self.pick if self.pick in names else self.name
+        self.pick = names[(names.index(cur) + d) % len(names) if cur in names else 0 if d > 0 else -1]; self.slot_text()
 
-    # Back button of the slot list (added v42).
-    def slots_close(self): self.pg_slots.pack_forget(); self.pg_steps.pack(fill="x")
-
-    # Load in the slot list: replaces the steps with that macro and makes it the selected macro of the Macros tab (added v42).
+    # Load button: replaces the steps with the browsed macro and makes it the selected macro of the Macros screen (added v42; changed v43).
     def slot_load(self):
-        s = self.sl.curselection()
-        if not s: return
-        name = self.sl.get(s[0]); steps = self.app.cfg["macros"].get(name)
-        if steps is None: return
-        self.push(); self.steps = json.loads(json.dumps(steps)); self.name, self.dirty, self.sel, self.arm = name, False, None, None
-        self.app.cfg["macro_sel"] = name; self.app.macro_refresh(); self.slots_close(); self.lit_add(); self.refresh()
+        a = self.app; steps = a.cfg["macros"].get(self.pick) if self.pick else None
+        if steps is None: return self.set_hint("Pick a saved macro with the arrows first")
+        name = self.pick; self.push(); self.steps = json.loads(json.dumps(steps))
+        self.name, self.dirty, self.sel, self.arm, self.pick = name, False, None, None, None
+        a.cfg["macro_sel"] = name; a.macro_refresh(); self.lit_add(); self.refresh()
 
-    # Delete in the slot list: removes that saved macro after a confirmation (the steps in the editor stay) (added v42).
+    # Delete button: removes the browsed (or current) saved macro after a confirmation; the steps in the editor stay (added v42; changed v43).
     def slot_delete(self):
-        s = self.sl.curselection()
-        if not s: return
-        name, a = self.sl.get(s[0]), self.app
+        a = self.app; name = self.pick or self.name
+        if name not in a.cfg["macros"]: return self.set_hint("Pick a saved macro with the arrows first")
         if self.prompt(a.confirm, "Delete macro", f"Delete the macro '{name}'?", [("Delete", True), ("Cancel", None)]) is not True: return
-        a.cfg["macros"].pop(name, None); a.cfg["macro_sel"] = next(iter(a.cfg["macros"]), ""); a.macro_refresh()
+        a.cfg["macros"].pop(name, None); a.macro_refresh(); self.pick = None
         if name == self.name: self.name = ""; self.dirty = True
-        self.slot_text(); self.slots_close() if not a.cfg["macros"] else self.slots_open()
+        self.slot_text()
 
-    # Test button: runs the steps on the accounts chosen by 'On:' using the 'Input:' mode. Background input keeps the overlay visible and
-    # lights up each step as it runs; real-mouse input hides the overlay (it would catch the clicks) until the run ends (added v42).
+    # Test button: runs the steps ONCE on the focused account only, using the 'Input:' mode. Background input keeps the overlay visible and
+    # lights up each step as it runs; real-mouse input hides the overlay (it would catch the clicks) until the run ends (added v42; changed v43).
     def test(self):
         a = self.app
         if not self.steps: return self.set_hint("Nothing to test - add some steps")
         if self.running: return
+        if self.rec: self.rec_stop()
         self.arm = None; self.lit_add(); a.collect(); bg = a.cfg["macro_bg"]
-        if not bg: self.hidden = True; self.vis(False)
-        self.running = True; self.render()
-        if not a.macro_start(json.loads(json.dumps(self.steps)), None, self.name or "builder test", self.test_done, self.on_run_step if bg else None):
+        self.running, self.ov_off = True, not bg; self.render(); self.follow()
+        if not a.macro_start([(None, self.hw, json.loads(json.dumps(self.steps)))], self.name or "builder test", self.test_done, self.on_run_step if bg else None, True):
             self.test_done()
 
     # Called from the worker thread before each step: hands the number over to the main thread (added v42).
@@ -1129,14 +1338,14 @@ class MacroBuilder:
 
     # The test run finished or failed to start: shows the overlay again (added v42).
     def test_done(self):
-        self.running, self.run_i, self.hidden = False, None, False
-        if self.alive: self.render()
+        self.running, self.run_i, self.ov_off = False, None, False
+        if self.alive: self.render(); self.follow()
 
     # Stop button: stops a running test (added v42).
     def stop(self):
-        if self.running: self.app.macro_abort()
+        if self.running: self.app.macro_panic()
 
-    # Closes the builder; asks first when there are unsaved changes (added v42).
+    # Closes the builder and its three layers; asks first when there are unsaved changes (added v42).
     def close(self, ask=True):
         if ask and self.dirty and self.steps:
             r = self.prompt(self.app.confirm, "Macro builder", "Save the changes before closing?", [("Save", True), ("Discard", False), ("Cancel", None)])
@@ -1144,15 +1353,11 @@ class MacroBuilder:
             if r:
                 self.save()
                 if self.dirty: return                          # the name prompt was cancelled: stay open
-        if self.running: self.app.macro_abort()
-        self.alive = False
-        if self.job:
-            try: self.app.after_cancel(self.job)
-            except Exception: pass
-        self.app.builder = None
-        for w in (self.ov, self.pn):
-            try:
-                if w is not None: w.destroy()
+        if self.rec: self.rec_stop()
+        if self.running: self.app.macro_panic()
+        self.alive, self.cap = False, None; self.app.builder = None
+        for w in self.layers.values():
+            try: w.destroy()
             except Exception: pass
 
 def grid_plan(n, W, H):
@@ -1226,6 +1431,9 @@ class App(ctk.CTk):
         self.mutex = kernel32.CreateMutexW(None, True, "ROBLOX_singletonMutex")   # lets several Roblox clients run
         saved = json.load(open(DATA)) if os.path.exists(DATA) else {}
         self.cfg = {**json.loads(json.dumps(DEFAULTS)), **{k: v for k, v in saved.items() if k in DEFAULTS}}
+        if "macro_map" not in saved and saved.get("macro_sel"):      # v42 'Run on' -> v43 macro per account: keep what it ran
+            t, names = saved.get("macro_target", ""), [a["name"] for a in self.cfg["accounts"]]
+            self.cfg["macro_map"] = {n: saved["macro_sel"] for n in (names if t == "All running accounts" else [t] if t in names else [])}
         self._saved = ""
         # per-account runtime state
         self.windows = {}                                   # account name -> hwnd
@@ -1241,26 +1449,31 @@ class App(ctk.CTk):
         self.sizing, self.ready, self._size, self._rz = False, False, None, None
         self.hk_thread, self.hk_tid = None, 0
         self.active = self.maxed = None
+        self.unfocused = False                              # True = nobody is focused, every instance is a tile (added v45)
         self.dock_local = self.last_dock = self._relayout = None
         self.dock_fast_until, self.hires, self._td, self._winpos = 0.0, False, None, None
         self.press, self.was_down, self.app_fg_top, self._tab, self._dirty, self.dock_fix = None, False, False, "", False, 0
         self._lay_job = None                                # pending live layout commit (added v39)
+        self._lay_note = ""                                 # last layout warning written to the log
+        self.redock_log, self._last_warn = 0.0, ("", 0.0)   # time of the last re-dock warning / last warning written to the log
         self.anim, self.flashes, self._anim_job = {}, {}, None   # running tile slides / border flashes / shared ticker (added v40)
-        self.rec, self.macro_on, self.m_pt, self.m_held, self.m_kd, self._m_job = None, False, None, 0, [], None   # recorder / macro run state (added v41)
+        self.macro_on, self.m_pt, self.m_held, self.m_kd, self._m_job = False, None, 0, [], None   # macro run state (added v41; the recorder is part of the builder since v43)
         self.dc_seen = {}                                   # Discord alert text -> last time sent (added v41)
-        self.builder, self.bld_wait, self.bg_job, self.macro_cb = None, False, None, None   # visual builder / opening / running background job / macro-end callback (added v42)
+        self.dc_last, self.dc_busy, self.dc_err, self.dc_warned = None, False, "", False   # Discord command polling: newest message id / request running / last error / empty-content hint (added v43)
+        self.counts, self.mrows = (0, 0, 0, 0), {}          # running / frozen / disconnected / crashed accounts; macro-per-account menus (added v43)
+        self.builder, self.bld_wait, self.bg_job, self.afk_job, self.macro_cb = None, False, None, None, None   # visual builder / opening / running background job / macro-end callback (added v42)
         # background work
         self.launch_jobs, self.launch_lock = 0, threading.Lock()
         self.afk_busy, self.afk_next = False, time.time() + 480
-        self.afk_hw = self.afk_pt = None; self.afk_pressed = False
+        self.afk_hw = self.afk_pt = self.afk_fg = None; self.afk_pressed = self.afk_icon = False
         self.sel, self.rows, self.v = {}, {}, {}
         self.latest_ver, self.pid_build, self.out_logged = None, {}, set()     # newest Roblox build, pid -> running build, warned pids
         self.vram, self.vram_ok, self.io_prev = {}, None, {}
-        self.gpu, self.gpu_total, self.gpu_ok = {}, 0.0, None      # pid -> GPU %, system GPU %, counters available?
-        self.build(); self.refresh(); self.macro_init()
+        self.gpu, self.gpu_ok = {}, None                           # pid -> GPU %, counters available?
+        self.build(); self.refresh()
         self.bind("<Configure>", self.on_resize, add="+"); self.bind("<Configure>", self.on_move, add="+"); self.after(1500, lambda: setattr(self, "ready", True))
         for delay, fn in ((40, self.poll), (1000, self.sync), (2000, self.dash), (600, self.badge_loop),
-                          (1500, self.heal_loop), (100, self.track_dock)):
+                          (1500, self.heal_loop), (100, self.track_dock), (6000, self.dc_poll)):
             self.after(delay, fn)
         for fn in (self.maintenance, self.watch_loop, self.gpu_loop, self.version_loop):
             threading.Thread(target=fn, daemon=True).start()
@@ -1283,6 +1496,11 @@ class App(ctk.CTk):
         return ctk.CTkButton(parent, text=text, command=cmd, width=w, height=h, corner_radius=12,
                              fg_color=TXT if primary else BTN, hover_color="#ffffff" if primary else BTN_H,
                              text_color=BG if primary else TXT, font=("Segoe UI Semibold", 13))
+
+    # Dark-red button for destructive or stop actions (Delete, End); w=0 lets a grid cell size it (added v43, replaces three copies of the same style).
+    def red_btn(self, parent, text, cmd, w=100, h=34, size=13):
+        return ctk.CTkButton(parent, text=text, command=cmd, width=w or 140, height=h, corner_radius=12, fg_color="#4a1d24", hover_color="#6b2833",
+                             text_color="#ff9a9a", font=("Segoe UI Semibold", size))
 
     # Creates a rounded settings card, optionally with a title (v28 or earlier).
     def card(self, parent, title=None):
@@ -1308,27 +1526,54 @@ class App(ctk.CTk):
                         fg_color=TXT, hover_color="#ffffff", checkmark_color=BG, border_color=BTN_H,
                         text_color=TXT).pack(side="left", padx=(0, 24))
 
-    def confirm(self, title, text, buttons, field=None, secret=False):
+    def confirm(self, title, text, buttons, field=None, secret=False, choices=None):
         """In-app prompt drawn over the whole window. Docked game windows are hidden meanwhile so nothing can cover it.
         buttons = [(label, value), ...]; the first is the primary action, the last one also answers Escape.
         field = initial text adds an entry (the primary button then returns its text, the others None);
+        choices = list of names adds a search bar and a list (the primary button, Enter or a double click returns the chosen name) (changed v44);
         The X in the top-right corner (and the app's own close button) answers like the last button. Returns the clicked value."""
         if self.modal: return None
         self.modal = True
+        if self.builder: self.builder.follow()                   # its layers would cover the prompt (added v43)
         hidden = [h for h in DOCKED if user32.IsWindow(h)]
         for h in hidden: user32.ShowWindow(h, 0)
         ov = ctk.CTkFrame(self, fg_color=BG, corner_radius=0); ov.place(x=0, y=0, relwidth=1, relheight=1); ov.lift()
-        card = ctk.CTkFrame(ov, fg_color=CARD, corner_radius=18); card.place(relx=0.5, rely=0.4, anchor="center")
+        card = ctk.CTkFrame(ov, fg_color=CARD, corner_radius=18); card.place(relx=0.5, rely=0.5 if choices is not None else 0.4, anchor="center")
         ctk.CTkLabel(card, text=title, font=("Segoe UI Semibold", 17), text_color=TXT).pack(padx=34, pady=(26, 6))
         ctk.CTkLabel(card, text=text, justify="left", text_color=MUTED, wraplength=420).pack(padx=34, pady=(0, 18))
         e = None
         if field is not None:
             e = ctk.CTkEntry(card, width=400, height=38, corner_radius=10, fg_color=FIELD, border_width=0, show="•" if secret else "")
             e.insert(0, field); e.pack(padx=34, pady=(0, 18))
-        out = tk.StringVar(); res = {}
-        # Button handler of the in-app prompt: stores which button (or the typed text) was chosen and closes the prompt.
+        out = tk.StringVar(); res = {}; lb = None
+        # Button handler of the in-app prompt: stores which button (or the typed text / chosen name) was chosen and closes the prompt.
         def pick(i):
-            res["v"] = e.get() if e is not None and i == 0 else buttons[i][1]; out.set("x")
+            if i == 0 and lb is not None:
+                s = lb.curselection()
+                if not s: return
+                res["v"] = lb.get(s[0])
+            else: res["v"] = e.get() if e is not None and i == 0 else buttons[i][1]
+            out.set("x")
+        if choices is not None:
+            e = ctk.CTkEntry(card, width=400, height=38, corner_radius=10, fg_color=FIELD, border_width=0, placeholder_text="Search...")
+            e.pack(padx=34, pady=(0, 8))
+            lf = tk.Frame(card, bg=FIELD); lf.pack(padx=34, pady=(0, 18)); sb = tk.Scrollbar(lf, orient="vertical")
+            lb = tk.Listbox(lf, height=10, width=34, bg=FIELD, fg=TXT, selectbackground="#3b8ee8", selectforeground="#ffffff", highlightthickness=0, bd=0,
+                            activestyle="none", exportselection=False, font=("Consolas", 12), yscrollcommand=sb.set)
+            sb.configure(command=lb.yview); lb.pack(side="left"); sb.pack(side="right", fill="y")
+            # Search bar: shows only the choices that contain the typed text and selects the first one.
+            def refill(ev=None):
+                if ev is not None and ev.keysym in ("Up", "Down", "Return"): return
+                q = e.get().strip().lower(); lb.delete(0, "end")
+                for c in choices:
+                    if q in c: lb.insert("end", c)
+                if lb.size(): lb.select_set(0)
+            # Up / Down in the search bar move the selection.
+            def move(d):
+                s = lb.curselection(); i = min(max((s[0] if s else 0) + d, 0), lb.size() - 1)
+                lb.selection_clear(0, "end"); lb.select_set(i); lb.see(i)
+            refill(); e.bind("<KeyRelease>", refill); e.bind("<Down>", lambda _: move(1)); e.bind("<Up>", lambda _: move(-1))
+            lb.bind("<Double-Button-1>", lambda _: pick(0))
         row = ctk.CTkFrame(card, fg_color="transparent"); row.pack(pady=(0, 26))
         for i, (label, _) in enumerate(buttons):
             self.btn(row, label, lambda i=i: pick(i), primary=(i == 0), w=130).pack(side="left", padx=6)
@@ -1366,7 +1611,8 @@ class App(ctk.CTk):
         self.active_label = ctk.CTkLabel(top, text="Focused: -", font=("Segoe UI Semibold", 14), text_color=TXT)
         self.active_label.pack(side="left", padx=8)
         self.fs = self.btn(top, "Fullscreen", self.fullscreen, w=130, h=32); self.fs.pack(side="right", padx=6)
-        sb = ctk.CTkFrame(view, fg_color="transparent", height=124); sb.pack(side="bottom", fill="x", padx=6, pady=(0, 4))
+        self.unf = self.btn(top, "Unfocus", self.toggle_unfocus, w=110, h=32); self.unf.pack(side="right", padx=0)
+        sb = self.sbar = ctk.CTkFrame(view, fg_color="transparent", height=124); sb.pack(side="bottom", fill="x", padx=6, pady=(0, 4))   # (self.sbar: the builder covers it, v43)
         sb.pack_propagate(False)
         lc = ctk.CTkFrame(sb, fg_color="transparent"); lc.pack(side="left", fill="y", padx=(0, 10))      # left corner, top to bottom
         ctk.CTkButton(lc, text="Anti-AFK now", command=lambda: self.start_afk(True), width=150, height=32, corner_radius=10,
@@ -1380,7 +1626,7 @@ class App(ctk.CTk):
         self.afk_label = ctk.CTkLabel(hd, text="AFK on:", text_color=MUTED); self.afk_label.pack(side="left", padx=(4, 10))
         self.btn(hd, "All", lambda: self.afk_all(True), w=50, h=26).pack(side="left", padx=(0, 6))
         self.btn(hd, "None", lambda: self.afk_all(False), w=56, h=26).pack(side="left")
-        self.afk_list = ctk.CTkScrollableFrame(rc, height=60, fg_color=FIELD, corner_radius=8)
+        self.afk_list = ctk.CTkScrollableFrame(rc, height=60, fg_color="transparent", corner_radius=0)
         self.afk_list.pack(fill="both", expand=True)
         self.afk_cells, self.afk_cols, self.afk_rc, self.afk_sb_on = [], 0, rc, True
         self.after(10, self.layout_afk)
@@ -1423,8 +1669,7 @@ class App(ctk.CTk):
                                      button_color=BTN, button_hover_color=BTN_H, dropdown_fg_color=CARD, state="readonly",
                                      command=self.pick_target)
         self.combo.grid(row=0, column=3, padx=(0, 6))
-        ctk.CTkButton(f, text="Delete", command=self.del_target, width=64, height=34, corner_radius=12, fg_color="#4a1d24",
-                      hover_color="#6b2833", text_color="#ff9a9a", font=("Segoe UI Semibold", 13)).grid(row=0, column=4)
+        self.red_btn(f, "Delete", self.del_target, 64).grid(row=0, column=4)
         self.join_box = ctk.CTkFrame(g, fg_color=FIELD, corner_radius=10); self.join_box.pack(fill="x", padx=12, pady=(2, 10))
         self.join_dot = ctk.CTkLabel(self.join_box, text="●", text_color=MUTED, font=("Segoe UI", 14), width=20)
         self.join_dot.pack(side="left", padx=(10, 2), pady=4)
@@ -1445,7 +1690,7 @@ class App(ctk.CTk):
         self.btn(hd, "Deselect all", self.sel_none, w=120, h=30).pack(side="left", padx=6)
         self.btn(hd, "Refresh status", self.refresh_status, w=130, h=30).pack(side="right", padx=6)
         self.rc_btn = self.btn(hd, "Roll call", self.toggle_compact, w=96, h=30); self.rc_btn.pack(side="right", padx=0)
-        self.perf_btn = self.btn(hd, "Performance", self.toggle_perf, w=110, h=30); self.perf_btn.place(relx=0.5, rely=0.5, anchor="center")
+        self.perf_btn = self.btn(hd, "Performance", self.toggle_perf, w=110, h=30); self.perf_btn.pack(side="right", padx=6)          # v49: next to Roll call, moves with the layout
         self.style_roll_btn()
         self.list = ctk.CTkScrollableFrame(left, fg_color=CARD, corner_radius=18, height=120)
         self.list.pack(fill="both", expand=True, padx=3, pady=(6, 3))
@@ -1462,9 +1707,7 @@ class App(ctk.CTk):
                 if it:
                     b = self.btn(bar, it[0], it[1], h=32); b.configure(font=("Segoe UI Semibold", 12))
                     b.grid(row=r, column=c, padx=2, pady=3, sticky="ew")
-        ctk.CTkButton(bar, text="Delete selected accounts", command=self.remove, height=32, corner_radius=12,
-                      fg_color="#4a1d24", hover_color="#6b2833", text_color="#ff9a9a",
-                      font=("Segoe UI Semibold", 12)).grid(row=4, column=1, padx=2, pady=3, sticky="ew")
+        self.red_btn(bar, "Delete selected accounts", self.remove, 0, 32, 12).grid(row=4, column=1, padx=2, pady=3, sticky="ew")
 
         # --- macros ---
         mc = self.card(mac, "Macro")
@@ -1473,52 +1716,46 @@ class App(ctk.CTk):
         self.mm = ctk.CTkOptionMenu(f, values=["-"], width=200, height=34, corner_radius=10, fg_color=BTN, button_color=BTN_H,
                                     button_hover_color=BTN_H, dropdown_fg_color=CARD, command=self.macro_pick)
         self.mm.pack(side="left", padx=(8, 14))
-        for t, cmd in (("Record", self.macro_record), ("New", self.macro_new), ("Save", self.macro_save), ("Delete", self.macro_delete)):
-            self.btn(f, t, cmd, w=84, h=34).pack(side="left", padx=3)
-        self.btn(f, "Visual builder", self.builder_open, primary=True, w=130, h=34).pack(side="left", padx=(12, 3))
-        self.mt = ctk.CTkTextbox(mc, height=240, fg_color=FIELD, corner_radius=10, font=("Consolas", 13), text_color=TXT)
-        self.mt.pack(fill="x", padx=14, pady=6)
+        self.btn(f, "Visual builder", self.builder_open, primary=True, w=130, h=34).pack(side="left", padx=(0, 6))
+        self.red_btn(f, "Delete", self.macro_delete, 84).pack(side="left", padx=3)
+        ctk.CTkLabel(mc, text="Macro per account", text_color=MUTED).pack(anchor="w", padx=18, pady=(8, 0))
+        self.mlist = ctk.CTkScrollableFrame(mc, height=220, fg_color=FIELD, corner_radius=10); self.mlist.pack(fill="x", padx=14, pady=6)
+        for c in range(3): self.mlist.grid_columnconfigure(c, weight=1, uniform="mc")
         f = self.line(mc)
-        ctk.CTkLabel(f, text="Run on", text_color=MUTED).pack(side="left")
-        self.mg = ctk.CTkOptionMenu(f, values=["Focused account"], width=220, height=34, corner_radius=10, fg_color=BTN, button_color=BTN_H,
-                                    button_hover_color=BTN_H, dropdown_fg_color=CARD, command=self.macro_target_pick)
-        self.mg.pack(side="left", padx=(8, 22))
         self.check(f, "Background input", "macro_bg")
         self.entry(f, "Repeat", "macro_loops", 50)
-        self.btn(f, "Run / stop", self.macro_toggle, primary=True, w=120, h=34).pack(side="left")
+        self.check(f, "Run forever", "macro_forever")
+        self.btn(f, "Run", self.macro_start, primary=True, w=100, h=34).pack(side="left", padx=(0, 8))
+        self.red_btn(f, "End", self.macro_panic, 100).pack(side="left")
         ctk.CTkLabel(mc, wraplength=900, justify="left", text_color=MUTED,
-                     text="One step per line; x and y are fractions (0-1) of the game window, so a macro works on any account and window size:  "
-                          "click x y [right]  |  hold x y ms [right]  |  swipe x1 y1 x2 y2 ms  |  key ctrl+shift+a  |  wait ms  ('#' starts a comment). "
-                          "Record opens a see-through layer over the focused window: click, hold (0.5 s+), drag to swipe, type keys or combos; "
-                          "Done saves. Visual builder puts numbered, draggable widgets over the focused window: [+] adds a step and you click or drag "
-                          "where it goes, the list sets the order, Save / Load keep named macros. Normal runs use the real mouse and keyboard like "
-                          "Anti-AFK, one account after another; with Background input ticked the clicks and keys are posted to the game windows instead "
-                          "(no cursor movement, no focus change, all accounts at once). Run / stop or the macro hotkey (Settings) stops a running macro."
+                     text="Visual builder: record or place clicks, holds, swipes and keys on the focused game, then save the macro.\n"
+                          "Pick a macro for every account above (None = that account does nothing), then press Run.\n"
+                          "Background input: clicks and keys are posted to the game windows - no cursor, no focus change, all accounts at once.\n"
+                          "Run forever repeats until you press End. End (or the macro hotkey) stops the macro at once and lets go of every key."
                      ).pack(anchor="w", padx=18, pady=(0, 14))
 
         # --- settings ---
         sc = ctk.CTkScrollableFrame(sett, fg_color=BG); sc.pack(fill="both", expand=True)
         c = self.card(sc, "Layout")
         f = self.line(c); self.entry(f, "Launch delay (s)", "delay", 60)
-        f = self.line(c); self.entry(f, "Tile area % of viewer width", "pane", 60)
-        self.btn(f, "Apply", lambda: self.apply_layout(pane=True), w=90, h=34).pack(side="left")
-        ctk.CTkLabel(f, text="Limits: 20-70 %, used with 2+ instances (one instance fills the viewer)", text_color=MUTED).pack(side="left", padx=12)
         f = self.line(c); self.check(f, "Custom tile size (unfocused window)", "micro")
         self.entry(f, "Width px", "windowWidth", 60); self.entry(f, "Height px", "windowHeight", 60)
-        ctk.CTkLabel(f, text="Limits: 40-4000 px", text_color=MUTED).pack(side="left")
+        ctk.CTkLabel(f, text="Limits: 40-4000 px. Applies at once; tiles shrink (same proportions) when they do not fit", text_color=MUTED).pack(side="left")
         f = self.line(c)
         ctk.CTkLabel(f, text="Presets", text_color=MUTED).pack(side="left")
         ctk.CTkOptionMenu(f, values=["320x240", "240x180", "200x150", "160x120", "120x90"], width=120, height=34,
                           corner_radius=10, fg_color=BTN, button_color=BTN_H, button_hover_color=BTN_H,
                           dropdown_fg_color=CARD, command=self.pick_size).pack(side="left", padx=(8, 22))
-        self.btn(f, "Apply", lambda: self.apply_layout(size=True), w=90, h=34).pack(side="left")
         f = self.line(c); self.check(f, "Username badges", "badges")
         f = self.line(c); self.check(f, "Animations", "anim"); self.entry(f, "Duration ms", "animMs", 60)
         ctk.CTkLabel(f, text="Limits: 0-600 ms (0 = off)", text_color=MUTED).pack(side="left")
-        f = self.line(c); self.btn(f, "Apply all", lambda: self.apply_layout(True, True, True), primary=True, w=140).pack(side="left")
-        for k in ("pane", "windowWidth", "windowHeight", "micro"): self.v[k].trace_add("write", self.layout_changed)
-        c = self.card(sc, "Graphics lock")
-        f = self.line(c); self.check(f, "Lock low graphics on launch", "gfx"); self.check(f, "Mute", "mute")
+        for k in ("windowWidth", "windowHeight", "micro"): self.v[k].trace_add("write", self.layout_changed)
+        c = self.card(sc, "Graphics")
+        f = self.line(c); self.check(f, "Apply low graphics on launch", "gfx"); self.check(f, "Mute", "mute")
+        f = self.line(c); self.check(f, "Keep file read-only", "gfx_lock"); self.check(f, "Start with leaderboard and chat closed", "hideui")
+        f = self.line(c); self.check(f, "Bare-bones Roblox settings", "bare")
+        ctk.CTkLabel(f, text="Turns off chat translation, vignette, player names, badges, tutorials, haptics, profilers; only keys already in the file", text_color=MUTED).pack(side="left")
+        ctk.CTkLabel(f, text="On (recommended) = each launched instance keeps your FPS/quality. Off = Roblox can also save window position / leaderboard state, but may overwrite FPS/quality", text_color=MUTED).pack(side="left")
         f = self.line(c); self.entry(f, "FPS cap", "fps", 60); self.entry(f, "Quality (1-10)", "quality", 60)
         f = self.line(c)
         self.btn(f, "Apply now", self.apply_gfx, w=120).pack(side="left", padx=(0, 10))
@@ -1530,12 +1767,12 @@ class App(ctk.CTk):
         f = self.line(c)
         self.entry(f, "Every (min)", "afk_min", 60); self.entry(f, "Corner offset (px)", "afk_off", 60)
         self.entry(f, "Click gap (ms)", "afk_gap", 70)
-        f = self.line(c); self.check(f, "Background input (no cursor movement, no focus change)", "afk_bg"); self.check(f, "Fake window activation", "bg_wake")
+        f = self.line(c); self.check(f, "Background input (no focus change, but the game may ignore it)", "afk_bg"); self.check(f, "Fake window activation", "bg_wake")
         ctk.CTkLabel(c, wraplength=700, justify="left", text_color=MUTED,
-                     text="Background input posts the Anti-AFK clicks (and macro steps, see the Macros tab) straight to each game window, focused or not, "
-                          "all at once. 'Fake window activation' tells an unfocused window it is active while it receives input and undoes that afterwards; "
-                          "turn it off if a game misbehaves with it. Whether a game accepts posted input is up to the game - try it with the Visual "
-                          "builder's Test button first."
+                     text="Default: every account is brought to the front for a moment and gets two real clicks (works from any tab, also minimized; "
+                          "your tab, cursor and program are put back afterwards; it waits while you are using the mouse). 'Background input' posts the "
+                          "clicks instead - no focus change and it also runs during macros, but many games ignore it. 'Fake window activation' only "
+                          "affects background input."
                      ).pack(anchor="w", padx=18, pady=(0, 14))
         c = self.card(sc, "Connection watch")
         f = self.line(c); self.check(f, "Auto-rejoin (max 3 per 30 min)", "auto_rejoin")
@@ -1545,21 +1782,41 @@ class App(ctk.CTk):
                           "row, so expect 1-2+ minutes. If an account uses 'appear offline', turn it off in the Viewer tab.").pack(anchor="w", padx=18, pady=(0, 14))
         c = self.card(sc, "Hotkeys")
         f = self.line(c); self.check(f, "Hotkeys", "hotkeys", lambda: self.hotkeys(self.v["hotkeys"].get()))
-        f = self.line(c); self.entry(f, "Macro hotkey", "macro_key", 170); self.btn(f, "Apply", self.apply_macro_key, w=90, h=34).pack(side="left")
-        ctk.CTkLabel(f, text="Starts / stops the macro of the Macros tab, e.g. ctrl+alt+m or F8", text_color=MUTED).pack(side="left", padx=12)
+        f = self.line(c); ctk.CTkLabel(f, text="Macro hotkey", text_color=MUTED).pack(side="left")
+        self.hk_v = []
+        for i, vals in enumerate((HK_MODS, HK_MODS, HK_PICK)):
+            if i: ctk.CTkLabel(f, text="+", text_color=MUTED).pack(side="left", padx=5)
+            var = tk.StringVar(value=hotkey_parts(self.cfg["macro_key"])[i]); self.hk_v.append(var)
+            if i < 2: ctk.CTkOptionMenu(f, values=vals, variable=var, width=100, height=34, corner_radius=10, fg_color=BTN, button_color=BTN_H,
+                                        button_hover_color=BTN_H, dropdown_fg_color=CARD, command=self.hk_pick).pack(side="left", padx=(8 if i == 0 else 0, 0))
+            else: self.hk_btn = self.btn(f, var.get(), self.hk_key, w=100, h=34); self.hk_btn.pack(side="left")
+        ctk.CTkLabel(f, text="_ = blank", text_color=MUTED).pack(side="left", padx=12)
+        ctk.CTkLabel(c, wraplength=700, justify="left", text_color=MUTED,
+                     text="Starts the macros, or stops everything while they run. The first two boxes are Ctrl / Shift / Alt / Win or blank, the last box is the key "
+                          "(ctrl + shift + k, or _ + _ + k for just K). A key without Ctrl / Shift / Alt / Win is blocked in every program while Hotkeys is on."
+                     ).pack(anchor="w", padx=18, pady=(0, 6))
         ctk.CTkLabel(c, wraplength=700, justify="left", text_color=MUTED,
                      text="Ctrl+Shift+1..9 focus the 1st..9th running account (tile order), Ctrl+Shift+Left / Right = previous / next. "
                           "Works while a game window has focus. If another program already uses a key, it is listed in the log."
                      ).pack(anchor="w", padx=18, pady=(0, 14))
         c = self.card(sc, "Discord alerts")
         f = self.line(c); self.check(f, "Message when an account crashes, disconnects or fails to launch", "dc_on")
+        f = self.line(c); self.btn(f, "Setup tutorial", lambda: webbrowser.open(DC_TUTORIAL), primary=True, w=130, h=34).pack(side="left")
         f = self.line(c); self.entry(f, "Channel ID", "dc_chan", 200); self.btn(f, "Set bot token", self.dc_token, w=130, h=34).pack(side="left", padx=(0, 8))
         self.dc_lab = ctk.CTkLabel(f, width=110, anchor="w", text_color=MUTED, text="Token: set" if self.cfg["dc_token"] else "Token: not set")
         self.dc_lab.pack(side="left", padx=(0, 8)); self.btn(f, "Send test", self.dc_test, w=110, h=34).pack(side="left")
+        f = self.line(c); self.entry(f, "Alert text", "dc_fmt", 430)
+        ctk.CTkLabel(f, text="{msg} {account} {time}", text_color=MUTED).pack(side="left")
+        f = self.line(c); self.check(f, "Answer commands written in the channel", "dc_cmd_on"); self.entry(f, "Prefix", "dc_prefix", 50)
+        self.btn(f, "Apply commands", self.dc_cmds_apply, w=150, h=34).pack(side="left")
+        self.dc_box = ctk.CTkTextbox(c, height=110, fg_color=FIELD, corner_radius=10, font=("Consolas", 13), text_color=TXT)
+        self.dc_box.pack(fill="x", padx=14, pady=(2, 6)); self.dc_box.insert("1.0", "\n".join(f"{n} = {r}" for n, r in self.cfg["dc_cmds"]))
         ctk.CTkLabel(c, wraplength=700, justify="left", text_color=MUTED,
-                     text="Create a bot in the Discord developer portal, invite it to your server with permission to post in one channel, then paste that "
-                          "channel's ID (Discord Developer Mode > right-click the channel > Copy ID) and set the bot token. The token is stored "
-                          "encrypted for this Windows user, like the cookies. The same alert is sent at most once a minute."
+                     text="Commands: one per line, name = reply (press Apply commands). Replies can use {running} {total} {frozen} {disc} {crashed} {accounts} "
+                          "{commands} {time} {version}. Setup: 1) create an app in the Discord developer portal (Setup tutorial), add a Bot, copy its token; "
+                          "2) for commands switch on 'Message Content Intent' on the Bot page; 3) invite the bot with View Channel, Send Messages and Read "
+                          "Message History; 4) paste the channel's ID (Developer Mode > right-click the channel > Copy ID) and set the token. The token is "
+                          "stored encrypted for this Windows user. The same alert is sent at most once a minute; commands are checked every 6 s."
                      ).pack(anchor="w", padx=18, pady=(0, 14))
         c = self.card(sc, f"Updates  (installed: v{VERSION})")
         f = self.line(c); self.entry(f, "Update link (https)", "update_url", 430)
@@ -1570,7 +1827,11 @@ class App(ctk.CTk):
 
     # ---------- logging ----------
     def log(self, msg, kind="info"):
-        """Timestamped event -> log panel + file. Safe to call from any thread."""
+        """Timestamped event -> log panel + file. Safe to call from any thread.
+        Changed v44: the same warning is written at most once per 30 s, so a repeating problem cannot flood the log."""
+        if kind == "warn":
+            if msg == self._last_warn[0] and time.time() - self._last_warn[1] < 30: return
+            self._last_warn = (msg, time.time())
         stamp = time.strftime("%H:%M:%S")
         try:
             with open(LOG, "a", encoding="utf-8") as fh: fh.write(f"{time.strftime('%Y-%m-%d')} {stamp}  {msg}\n")
@@ -1580,10 +1841,12 @@ class App(ctk.CTk):
 
     # Writes one timestamped line into the log panel; called on the main thread (added v33, split out of log).
     def log_line(self, stamp, msg, kind):
+        at_end = self.logbox.yview()[1] >= 0.999          # changed v44: only follow new lines when already at the bottom
         self.logbox.configure(state="normal")
         self.logbox.insert("end", f"{stamp}  {msg}\n", kind)
         if int(self.logbox.index("end-1c").split(".")[0]) > 1500: self.logbox.delete("1.0", "300.0")
-        self.logbox.configure(state="disabled"); self.logbox.see("end")
+        self.logbox.configure(state="disabled")
+        if at_end: self.logbox.see("end")
 
     # Short hint such as 'tick accounts first': shown in the log panel only, not saved to the log file (v28; reworked v33).
     def say(self, text):                                    # short hint ("tick accounts first"): shown in the log panel only
@@ -1594,7 +1857,7 @@ class App(ctk.CTk):
         self.logbox.configure(state="normal"); self.logbox.delete("1.0", "end"); self.logbox.configure(state="disabled")
 
     # ---------- config ----------
-    PENDING = {"micro", "windowWidth", "windowHeight", "pane", "macro_key"}      # committed by apply_layout only
+    PENDING = {"micro", "windowWidth", "windowHeight"}              # committed by live_layout only
 
     # Copies every settings widget value into self.cfg; entries in PENDING are only committed by apply_layout / live_layout (v28 or earlier).
     def collect(self):
@@ -1735,7 +1998,7 @@ class App(ctk.CTk):
     # Rebuilds the account rows and the Viewer AFK list from the saved accounts (v28; split into build_rows in v36).
     def refresh(self):
         self.build_rows(); self.build_afk_list([a["name"] for a in self.cfg["accounts"]]); self.after(50, self.update_rows)
-        self.macro_targets_refresh()
+        self.macro_refresh()
 
     # Creates the account rows in one of three views: normal, Roll call (compact) or Performance (added v36; Performance v37).
     def build_rows(self):
@@ -1805,22 +2068,22 @@ class App(ctk.CTk):
             if r: put(r, "st", text, color)
         self.after(0, go)
 
-    # Creates one Anti-AFK checkbox for an account (v28 or earlier).
-    def afk_box(self, parent, n):
-        return ctk.CTkCheckBox(parent, text=n, variable=self.afk_sel[n], command=self.afk_toggle, width=20,
-                               height=20, checkbox_width=18, checkbox_height=18, corner_radius=5, fg_color=TXT, hover_color="#ffffff",
-                               checkmark_color=BG, border_color=BTN_H, text_color=TXT, font=("Segoe UI", 12))
+    def afk_chip(self, parent, n):
+        """One Anti-AFK pill for an account: bright = Anti-AFK on, dim = skipped. Clicking flips it."""
+        var, b = self.afk_sel[n], ctk.CTkButton(parent, text=n, width=150, height=26, corner_radius=13, font=("Segoe UI", 12))
+        # Colours the pill by its state.
+        def style(): on = var.get(); b.configure(fg_color=TXT if on else CARD, hover_color="#ffffff" if on else BTN, text_color=BG if on else MUTED)
+        # Click: flips the account and stores the change.
+        def flip(): var.set(not var.get()); style(); self.afk_toggle()
+        b.configure(command=flip); style(); b.restyle = style
+        return b
 
     # Rebuilds the Viewer's Anti-AFK account list (v28; grid of columns with an auto scrollbar since v32).
     def build_afk_list(self, names):
         for w in self.afk_list.winfo_children(): w.destroy()
         skip = set(self.cfg["afk_skip"])
         self.afk_sel = {n: tk.BooleanVar(value=n not in skip) for n in names}     # the one source of truth
-        self.afk_cells = []
-        for n in names:
-            cell = ctk.CTkFrame(self.afk_list, fg_color=CARD, corner_radius=7, width=170, height=24)
-            cell.pack_propagate(False); self.afk_cells.append(cell)
-            self.afk_box(cell, n).pack(anchor="w", padx=8, expand=True)
+        self.afk_cells = [self.afk_chip(self.afk_list, n) for n in names]
         self.afk_cols = 0; self.layout_afk()
         self.afk_count()
 
@@ -1830,10 +2093,10 @@ class App(ctk.CTk):
         try:
             w = self.afk_rc.winfo_width()
             n = len(self.afk_cells)
-            cols = max(1, (max(w, 200) - (24 if n > 3 else 4)) // 176)
+            cols = max(1, (max(w, 200) - (24 if n > 3 else 4)) // 160)
             rows = -(-n // cols) if n else 0
             if rows > 3 and cols > 1:                       # the scrollbar costs width: recount without it
-                cols = max(1, (max(w, 200) - 24) // 176); rows = -(-n // cols)
+                cols = max(1, (max(w, 200) - 24) // 160); rows = -(-n // cols)
             need = rows > 3
             if cols != self.afk_cols:
                 self.afk_cols = cols
@@ -1848,6 +2111,7 @@ class App(ctk.CTk):
     # All / None buttons of the Anti-AFK list (v28 or earlier).
     def afk_all(self, on):
         for v in self.afk_sel.values(): v.set(on)
+        for c in self.afk_cells: c.restyle()
         self.afk_toggle()
 
     # Stores which accounts are skipped by Anti-AFK and updates the counter (v28 or earlier).
@@ -1968,8 +2232,9 @@ class App(ctk.CTk):
     def apply_gfx(self):
         self.collect()
         try:
-            apply_graphics(self.cfg["fps"], self.cfg["quality"], self.cfg["mute"])
-            self.log(f"Graphics lock written (FPS {self.cfg['fps']}, quality {self.cfg['quality']}), file is read-only")
+            lock = bool(self.cfg.get("gfx_lock"))
+            apply_graphics(self.cfg["fps"], self.cfg["quality"], self.cfg["mute"], lock, self.cfg["hideui"], self.cfg["bare"])
+            self.log(f"Graphics written (FPS {self.cfg['fps']}, quality {self.cfg['quality']}), file is {'read-only' if lock else 'writable'}")
         except Exception as ex: self.note("Settings", str(ex))
 
     # Unlocks the Roblox settings file from the Settings tab (v28 or earlier).
@@ -2196,11 +2461,11 @@ class App(ctk.CTk):
     # Computes tile slots, the focus-pane rectangle and whether the custom size fits (v28 or earlier; changed v39: a custom
     # tile size is kept and only scaled down, same proportions, when it does not fit - it never switches to the automatic size;
     # changed v40: tiles stack from the top-left corner and the focused window fills all the space right of them).
-    def plan(self, n):
-        """-> (tile slots, focus-pane rect, tiles fit?) in stage coordinates."""
+    def plan(self, n, full=False):
+        """-> (tile slots, focus-pane rect, tiles fit?) in stage coordinates. full=True: no focus pane, the tiles may use the whole viewer."""
         W, H = self.stage_size()
-        multi = n > 1
-        tw = int(W * max(20, min(70, self.cfg["pane"])) / 100) if multi else W
+        multi = n > 1 and not full
+        tw = int(W * (0.60 if self.cfg["micro"] else 0.38)) if multi else W       # changed v45: fixed share, no tile-area setting
         fits = True
         if self.cfg["micro"]:
             w0, h0 = max(40, self.cfg["windowWidth"]), max(40, self.cfg["windowHeight"])
@@ -2237,21 +2502,27 @@ class App(ctk.CTk):
             self.after(30, self.update_badges); self.after(60, lambda h=self.maxed: self.give_focus(h))
             return
         if self.active is None: self.active = wins[0]
-        slots, fr, fits = self.plan(len(wins))
+        unf = self.unfocused
+        slots, fr, fits = self.plan(len(wins), unf)
         for i, hw in enumerate(wins):
-            self.place(hw, fr if hw == self.active else slots[i])
-        self.sync_ph(wins, slots); self.stage.update_idletasks()
-        big = sum(1 for i, hw in enumerate(wins) if hw != self.active
+            self.place(hw, fr if hw == self.active and not unf else slots[i])
+        if unf: self.placeholder(None)
+        else: self.sync_ph(wins, slots)
+        self.stage.update_idletasks()
+        big = sum(1 for i, hw in enumerate(wins) if (unf or hw != self.active)
                   and (win_rect(hw).right - win_rect(hw).left > slots[i][2] + 3 or win_rect(hw).bottom - win_rect(hw).top > slots[i][3] + 3))
-        msg = f"Layout: {len(wins)} windows, tiles {slots[0][2]}x{slots[0][3]}"
-        if big: msg += f" - {big} resisted resizing and are cropped to their tile"
-        if not fits: msg += " - custom tile size doesn't fit the tile area, scaled down (raise Tile area % for the exact size)"
+        note = ""
+        if big: note = f"Layout: {big} tile(s) refuse to get as small as {slots[0][2]}x{slots[0][3]} (Roblox has a minimum window size) - cropped to the tile. "
+        if not fits: note += "Custom tile size does not fit, scaled down. "
+        if note != self._lay_note:
+            self._lay_note = note
+            if note: self.log(note.strip(), "warn")
         extra = tuple(sorted(h for h in roblox_windows() if h not in wins))
         if extra and extra != getattr(self, "_extra", ()):
             self.log("Roblox window(s) open but not managed by Better RAM (pid " + ", ".join(str(pid_of(h)) for h in extra) +
                      ") - leftover from an earlier session? Close them, they cannot be placed in the viewer", "warn")
         self._extra = extra
-        self.layout_msg = msg; self.after(30, self.update_badges); self.set_active_label()
+        self.after(30, self.update_badges); self.set_active_label()
 
     # Positions one tile cell at a rectangle and rounds its corners (v28 or earlier).
     def place(self, hw, rect):
@@ -2259,7 +2530,7 @@ class App(ctk.CTk):
         cell = self.cell_for(hw)
         self.move_cell(cell, hw, x, y, w, h)
         if cell.rgn != (w, h): cell.rgn = (w, h); round_region(cell.winfo_id(), w, h, RADIUS)
-        if hw == self.active:                                # focused instance = real window docked over the pane
+        if hw == self.active and not self.unfocused:         # focused instance = real window docked over the pane
             self.dock_local = rect; self.dock(hw)
         else:
             if hw in DOCKED: self.undock(hw, cell)           # just lost focus -> back into its tile
@@ -2270,7 +2541,7 @@ class App(ctk.CTk):
     def move_cell(self, cell, hw, x, y, w, h):
         ms = min(600, max(0, self.cfg["animMs"])) if self.cfg["anim"] else 0
         old = getattr(cell, "cur", None)
-        if ms and hw != self.active and old and old != (x, y) and cell.rgn == (w, h) and cell.winfo_ismapped():
+        if ms and (hw != self.active or self.unfocused) and old and old != (x, y) and cell.rgn == (w, h) and cell.winfo_ismapped():
             self.anim[cell] = (old[0], old[1], x, y, time.time(), ms); self.anim_go()
         else:
             self.anim.pop(cell, None); cell.cur = (x, y); cell.place(x=x, y=y, width=w, height=h)
@@ -2459,11 +2730,14 @@ class App(ctk.CTk):
     # Updates the 'Focused: name' label (v28 or earlier).
     def set_active_label(self):
         name = next((n for n, h in self.windows.items() if h == self.active), None)
-        self.active_label.configure(text=f"Focused: {name}" if name else "Focused: -")
+        self.active_label.configure(text="Focused: none" if self.unfocused else f"Focused: {name}" if name else "Focused: -")
 
     # Makes a window the focused one (swaps it with the previous focused tile) (v28 or earlier).
     def switch_to(self, hw):
-        if hw == self.active: return
+        """Changed v45: from the unfocused layout the instance gets the focus and everything is laid out again."""
+        if hw == self.active and not self.unfocused: return
+        if self.unfocused:
+            self.unfocused, self.active = False, hw; self.retile(); self.after(80, lambda: self.give_focus(hw)); return
         old, self.active = self.active, hw
         wins = self.live()
         if hw not in wins: return
@@ -2484,26 +2758,33 @@ class App(ctk.CTk):
     def fullscreen(self):
         """One button: the focused instance fills the viewer; press again to bring the tiles back."""
         if self.maxed: self.maxed = None
-        elif self.live() and self.active: self.maxed = self.active
+        elif self.live() and self.active: self.maxed, self.unfocused = self.active, False
         else: return self.say("No instance running")
         self.retile()
+
+    def toggle_unfocus(self):
+        """Top-right button: nobody is focused, every instance sits in its own tile; press again to focus one again."""
+        if not self.live(): return self.say("No instance running")
+        self.unfocus(not self.unfocused)
+
+    def unfocus(self, on):
+        """Switches the unfocused layout on or off and lays everything out again (a docked game window goes back into its tile)."""
+        if on == self.unfocused: return
+        self.unfocused = on
+        if on: self.maxed = None
+        self.retile()
+        if not on and self.active: self.after(80, lambda h=self.active: self.give_focus(h))
 
     # Keeps the Fullscreen button text in sync (v28 or earlier).
     def sync_fs(self):
         t = "Exit fullscreen" if self.maxed else "Fullscreen"
         if self.fs.cget("text") != t: self.fs.configure(text=t)
+        t = "Focus" if self.unfocused else "Unfocus"
+        if self.unf.cget("text") != t: self.unf.configure(text=t)
 
     # Preset menu for tile size: only fills the fields, 'Apply' commits (v28 or earlier).
     def pick_size(self, choice):                             # only fills the fields; "Apply" commits them
         w, h = choice.split("x"); self.v["windowWidth"].set(w); self.v["windowHeight"].set(h)
-
-    def num(self, key, lo, hi):
-        """Reads just the digits of an entry (so '40%' or ' 320 px' work), limits it, writes the clean number back."""
-        m = re.search(r"\d+", str(self.v[key].get()))
-        if not m: return None, None
-        raw = int(m.group()); n = min(hi, max(lo, raw))
-        self.v[key].set(str(n)); self.cfg[key] = n
-        return n, raw
 
     # Typing in a layout entry (or ticking Custom tile size) schedules live_layout 0.7 s after the last change (added v39).
     def layout_changed(self, *_):
@@ -2515,35 +2796,13 @@ class App(ctk.CTk):
     def live_layout(self):
         self._lay_job = None
         try:
-            for k, lo, hi in (("pane", 20, 70), ("windowWidth", 40, 4000), ("windowHeight", 40, 4000)):
+            for k, lo, hi in (("windowWidth", 40, 4000), ("windowHeight", 40, 4000)):
                 m = re.search(r"\d+", str(self.v[k].get()))
                 if m: self.cfg[k] = min(hi, max(lo, int(m.group())))
             self.cfg["micro"] = bool(self.v["micro"].get())
         except tk.TclError: return
         if self.tv.get() == "Viewer": self.retile()
         else: self._dirty = True
-
-    # Commits the layout entries and re-tiles, every step confirmed in the log (v28 or earlier; changed v39: cancels the pending live_layout).
-    def apply_layout(self, size=False, pane=False, other=False):
-        """Commit layout entries (they are not used before) and re-tile; every step is confirmed in the log."""
-        if other:
-            self.collect(); self.log(f"Launch delay {self.cfg['delay']} s, username badges {'on' if self.cfg['badges'] else 'off'}")
-        if size:
-            self.cfg["micro"] = bool(self.v["micro"].get())
-            (w, rw), (h, rh) = self.num("windowWidth", 40, 4000), self.num("windowHeight", 40, 4000)
-            if w is None or h is None: self.log("Custom tile size: type a number for width and height", "warn")
-            else:
-                self.log(f"Custom tile size {'ON' if self.cfg['micro'] else 'OFF (automatic sizes)'}: {w}x{h} px"
-                         + (" (limited to 40-4000)" if (w, h) != (rw, rh) else ""))
-        if pane:
-            n, raw = self.num("pane", 20, 70)
-            if n is None: self.log("Tile area: type a number (20-70)", "warn")
-            else: self.log(f"Tile area set to {n}% of viewer width" + (f" (you typed {raw}, allowed 20-70)" if n != raw else ""))
-        if self._lay_job: self.after_cancel(self._lay_job); self._lay_job = None
-        if not self.live(): return self.log("No Roblox windows open - the layout is used as soon as they start")
-        self.layout_msg = ""; self.retile()
-        self.log(self.layout_msg or ("Saved - applied when you open the Viewer tab" if self._dirty
-                 else "Saved - fullscreen is on, 'Exit fullscreen' in the Viewer tab brings the tiles back"))
 
     def on_resize(self, e):
         """Every customtkinter widget redraws on each step of a window drag (slow). Hide the content while the size is
@@ -2641,7 +2900,11 @@ class App(ctk.CTk):
             hw = self.active
             if hw and hw in DOCKED and user32.IsWindow(hw) and self.dock_local:
                 if self.tv.get() != "Viewer" or self.state() == "iconic":
-                    if user32.IsWindowVisible(hw): user32.ShowWindow(hw, 0)
+                    # v45: park it far offscreen instead of hiding it, so Roblox keeps its surface and does not reload on return
+                    r = win_rect(hw)
+                    if r.left != -32000 or r.top != -32000 or not user32.IsWindowVisible(hw):
+                        user32.SetWindowPos(hw, 0, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+                    self.last_dock = None                      # forces the move back into the pane when the Viewer tab returns
                 else:
                     x, y, w, h = self.dock_local
                     want = (self.stage.winfo_rootx() + x, self.stage.winfo_rooty() + y, w, h)
@@ -2650,7 +2913,8 @@ class App(ctk.CTk):
                           max(abs(r.left - want[0]), abs(r.top - want[1]), abs(r.right - r.left - w), abs(r.bottom - r.top - h)) > 2
                     if bad: self.dock_fast_until = time.time() + 0.5
                     if bad and self.dock_fix < 25:           # Roblox put its frame/size back (e.g. while still starting): dock it again
-                        if not self.dock_fix: self.log("Focused window left its pane - re-docking", "warn")
+                        if not self.dock_fix and time.time() - self.redock_log > 60:      # changed v44: at most one warning a minute
+                            self.redock_log = time.time(); self.log("Focused window left its pane - re-docking", "warn")
                         self.dock_fix += 1
                         _restyle(hw, WS_POPUP | WS_VISIBLE, WS_EX_TOOLWINDOW)
                         user32.SetWindowPos(hw, 0, *want, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED)
@@ -2666,6 +2930,7 @@ class App(ctk.CTk):
                 try: (ctypes.windll.winmm.timeBeginPeriod if fast else ctypes.windll.winmm.timeEndPeriod)(1)
                 except Exception: pass
                 self.hires = fast
+            if self.builder: self.builder.follow()               # builder layers follow with the same timing (added v43)
             self._td = self.after(10 if fast else 80 if self.dock_fix else 200, self.track_dock)
 
     def verify_layout(self):
@@ -2798,6 +3063,7 @@ class App(ctk.CTk):
                      ("crashed", f"Crashed {crashed}"), ("ram", f"RAM {ram/1024:.1f} GB"), ("cpu", f"CPU {cpu_t:.0f}%"),
                      ("gpu", f"GPU {min(100, gpu_t):.0f}%" if self.gpu_ok else "GPU n/a")):
             put(self.sum, k, t)
+        self.counts = (run, frozen, disc, crashed)            # read by the Discord commands (added v43)
 
     def version_loop(self):
         """Asks Roblox which build is current (every 15 min). Network trouble just keeps the last answer."""
@@ -2827,8 +3093,8 @@ class App(ctk.CTk):
                 time.sleep(1.5 if self.windows else 4)
                 r = gpu_sample()
                 if r is None: self.gpu_ok = False; time.sleep(30); continue      # counters missing (old Windows / no driver)
-                self.gpu, self.gpu_total, self.gpu_ok = r[0], r[1], True
-                self.vram_ok = r[2] is not None; self.vram = r[2] or {}
+                self.gpu, self.gpu_ok = r[0], True
+                self.vram_ok = r[1] is not None; self.vram = r[1] or {}
             except Exception: time.sleep(5)
 
     def rebind(self, n, old):
@@ -2922,7 +3188,7 @@ class App(ctk.CTk):
 
     # Handles one Ctrl+Shift hotkey press: 1-9 focus that account by position, Left / Right focus the previous / next one (v28 or earlier).
     def hotkey(self, i):
-        if i == 20: return self.macro_toggle()               # macro hotkey (added v41)
+        if i == 20: return self.macro_toggle()               # macro hotkey: End while running, otherwise Run (added v41; changed v43)
         if self.modal or self.busy: return
         alive = self.live(); names = [n for n, h in self.windows.items() if h in alive]
         if not names: return
@@ -2932,23 +3198,16 @@ class App(ctk.CTk):
             idx = (cur + (-1 if i == 10 else 1)) % len(names)
         if idx < len(names): self.show(names[idx])
 
-    # ---------- anti-AFK: visit each instance and click for real (a tile can't hold OS focus) ----------
-    def run_seq(self, steps):
-        if not steps: return
-        d, fn = steps[0]
-        # Runs one step of the Anti-AFK sequence, then the rest (run_seq helper).
-        def go():
-            try: fn()
-            finally: self.run_seq(steps[1:])
-        self.after(d, go)
-
-    # Starts an Anti-AFK round (clicks each account's window); waits when the user is active or the app is minimized (v28 or earlier;
-    # changed v42: with 'Background input' on, the round is posted to the windows instead - see afk_bg_round - and needs no waiting).
+    # ---------- anti-AFK ----------
     def start_afk(self, force=False):
-        if self.afk_busy: return
+        """Anti-AFK round. Default (real click): each account is brought to the front for a moment and gets two REAL clicks in its corner,
+        because many games ignore clicks posted to a window that has no focus. It does not need the Viewer tab or the app in front: a
+        minimized app is restored for the round, then the tab, focused account, cursor, minimized state and the program you were using
+        are put back. With 'Background input' ticked it posts the clicks instead (no focus change, but the game may ignore them).
+        Changed v44: real round restored, works from any tab / minimized, restores your foreground program."""
+        if self.afk_busy or self.afk_job: return
         if self.cfg["afk_bg"]: return self.afk_bg_round(force)
-        if self.state() == "iconic":
-            self.afk_next = time.time() + 60; return self.say("Anti-AFK waiting: the manager is minimized")
+        if self.macro_on: self.afk_next = time.time() + 30; return
         if not force and user_idle_seconds() < 8:
             self.afk_next = time.time() + 30; return          # you're busy: try again shortly
         alive, skip = self.live(), set(self.cfg["afk_skip"])
@@ -2956,164 +3215,210 @@ class App(ctk.CTk):
         if not wins: return
         gap = max(300, self.cfg["afk_gap"])
         self.afk_busy = True
-        self.afk_prev = (self.tv.get(), self.active)
+        self.afk_prev = (self.tv.get(), self.active, self.unfocused)
+        self.afk_fg, self.afk_icon = user32.GetForegroundWindow(), self.state() == "iconic"
         old = wt.POINT(); user32.GetCursorPos(ctypes.byref(old)); self.afk_cursor = (old.x, old.y)
+        if self.afk_icon: self.state("normal")
         if self.tv.get() != "Viewer": self.tv.set("Viewer")
-        steps = []
+        steps = [(900 if self.afk_icon else 1, lambda: None)]
         for hw in wins:
-            if hw == self.active and not force and user_idle_seconds() < 60: continue
             steps += [(700, lambda h=hw: self.switch_to(h)), (900, lambda h=hw: self.afk_aim(h)),
                       (300, self.afk_down), (150, self.afk_up), (gap, self.afk_down), (150, self.afk_up)]
         steps.append((600, self.afk_finish))
         self.log(f"Anti-AFK round started ({len(wins)} instances)")
         self.run_seq(steps)
 
-    # Moves the cursor to the Anti-AFK click spot of a window (v28 or earlier).
+    def run_seq(self, steps):
+        """Runs (delay ms, action) pairs one after another on the main thread."""
+        if not steps: return
+        d, fn = steps[0]
+        # Runs one step, then the rest.
+        def go():
+            try: fn()
+            finally: self.run_seq(steps[1:])
+        self.after(d, go)
+
     def afk_aim(self, hw):
+        """Moves the cursor to the Anti-AFK click spot of a window."""
         self.afk_hw = hw
         rc = wt.RECT(); user32.GetClientRect(hw, ctypes.byref(rc)); off = max(1, self.cfg["afk_off"])
         pt = wt.POINT(max(1, rc.right - off), max(1, rc.bottom - off)); user32.ClientToScreen(hw, ctypes.byref(pt))
         user32.SetCursorPos(pt.x, pt.y); self.afk_pt = pt
 
-    # Presses the mouse only if the cursor is really over that game window (v28 or earlier).
     def afk_down(self):
+        """Presses the mouse only if the cursor is really over that game window."""
         pt = self.afk_pt
         self.afk_pressed = bool(pt and self.afk_hw and user32.IsWindow(self.afk_hw)
                                 and self.owner_of(user32.WindowFromPoint(pt)) == self.afk_hw)   # never click anything else
         if self.afk_pressed: user32.mouse_event(2, 0, 0, 0, 0)
 
-    # Releases the mouse button after afk_down (v28 or earlier).
     def afk_up(self):
+        """Releases the mouse button after afk_down."""
         if self.afk_pressed: user32.mouse_event(4, 0, 0, 0, 0); self.afk_pressed = False
 
-    # Restores the previous tab, focused account and cursor after an Anti-AFK round (v28 or earlier).
     def afk_finish(self):
-        prev_tab, prev_active = self.afk_prev
+        """Puts back the tab, focused account, cursor, minimized state and the program that was in front before the round."""
+        prev_tab, prev_active, prev_unf = self.afk_prev
         if prev_active in self.live() and prev_active != self.active: self.switch_to(prev_active)
+        if prev_unf: self.unfocus(True)                      # back to every instance minimized into its tile
         if prev_tab != "Viewer": self.after(800, lambda: self.tv.set(prev_tab))
         user32.SetCursorPos(*self.afk_cursor)
+        fg = self.afk_fg
+        if fg and user32.IsWindow(fg) and fg != self.top_hwnd() and fg not in self.windows.values(): user32.SetForegroundWindow(fg)
+        if self.afk_icon: self.after(900, self.iconify)
         self.afk_busy = False
         self.log("Anti-AFK round done", "ok")
 
-    # ---------- macros (added v41): saved click / hold / swipe / key sequences played on the real windows like Anti-AFK ----------
-    # Selects a valid macro at startup and fills the Macros tab (added v41).
-    def macro_init(self):
-        if self.cfg["macro_sel"] not in self.cfg["macros"]: self.cfg["macro_sel"] = next(iter(self.cfg["macros"]), "")
-        self.macro_refresh()
+    def afk_bg_round(self, force=False):
+        """Background Anti-AFK: every selected account gets a posted click in its bottom-right corner, a pause and a second click, all at once,
+        with no cursor movement or focus change. Runs in its own job slot, also while a macro runs. The focused account is skipped only while
+        you are playing it. Changed v44: own job slot, works during macros."""
+        if self.afk_job: return
+        alive, skip, fg = self.live(), set(self.cfg["afk_skip"]), user32.GetForegroundWindow()
+        wins = [h for n, h in self.windows.items() if h in alive and n not in skip
+                and not (h == self.active and not force and fg == h and user_idle_seconds() < 60)]
+        if not wins: return
+        off, gap, wake = max(1, self.cfg["afk_off"]), max(300, self.cfg["afk_gap"]), self.cfg["bg_wake"]
+        # Worker thread body for one window: click near the bottom-right corner, pause, click again (no Tk, no self.windows).
+        def work(hw, stop):
+            w, h = client_size(hw); fx, fy = max(0.0, (w - off) / max(w, 1)), max(0.0, (h - off) / max(h, 1))
+            bg_play(hw, [["click", fx, fy, "left"], ["wait", gap], ["click", fx, fy, "left"]], stop, wake)
+        self.log(f"Anti-AFK round started in the background ({len(wins)} instances)")
+        self.bg_start("Anti-AFK round", wins, work, slot="afk_job")
 
-    # Fills the Macros tab from the config: macro menu, step text and run-on menu (added v41).
+    # ---------- macros (added v41; v43: one macro per account, Run forever, End button, recorder merged into the builder) ----------
+    # Fills the Macros screen from the config: the macro menu (used by the builder and Delete) and one macro menu per account. Assignments of
+    # deleted macros and removed accounts are dropped, so the lists are right after builder saves, Delete and account changes (added v41; changed v43).
     def macro_refresh(self):
-        sel = self.cfg["macro_sel"]
-        self.mm.configure(values=list(self.cfg["macros"]) or ["-"]); self.mm.set(sel or "-")
-        self.mt.delete("1.0", "end"); self.mt.insert("1.0", "\n".join(fmt_step(x) for x in self.cfg["macros"].get(sel, [])))
-        self.macro_targets_refresh()
+        cfg = self.cfg; names = list(cfg["macros"]); accts = [a["name"] for a in cfg["accounts"]]
+        if cfg["macro_sel"] not in cfg["macros"]: cfg["macro_sel"] = names[0] if names else ""
+        self.mm.configure(values=names or ["-"]); self.mm.set(cfg["macro_sel"] or "-")
+        mp = cfg["macro_map"]
+        for n in [n for n in mp if n not in accts or mp[n] not in cfg["macros"]]: del mp[n]
+        for n in [n for n in self.mrows if n not in accts]: self.mrows.pop(n)[0].destroy()
+        for i, n in enumerate(accts):                       # roll call look: cards, 3 per row [account | macro]
+            if n not in self.mrows:
+                row = ctk.CTkFrame(self.mlist, fg_color=CARD, corner_radius=10); row.grid_columnconfigure(1, weight=1)
+                ctk.CTkLabel(row, text=n, anchor="w", width=96, text_color=TXT, font=("Segoe UI", 12)).grid(row=0, column=0, padx=(10, 4), pady=8, sticky="w")
+                menu = ctk.CTkOptionMenu(row, values=["None"], height=28, corner_radius=8, fg_color=BTN, button_color=BTN_H, font=("Segoe UI", 12),
+                                         button_hover_color=BTN_H, dropdown_fg_color=CARD, command=lambda v, n=n: self.macro_assign(n, v))
+                menu.grid(row=0, column=1, padx=(0, 8), sticky="ew"); self.mrows[n] = (row, menu)
+            self.mrows[n][0].grid(row=i // 3, column=i % 3, padx=3, pady=3, sticky="ew")
+            self.mrows[n][1].configure(values=["None"] + names); self.mrows[n][1].set(mp.get(n, "None"))
 
-    # Refreshes the 'Run on' menu: focused account, all running accounts, or one account (added v41).
-    def macro_targets_refresh(self):
-        if not hasattr(self, "mg"): return
-        vals = ["Focused account", "All running accounts"] + [a["name"] for a in self.cfg["accounts"]]
-        if self.cfg["macro_target"] not in vals: self.cfg["macro_target"] = vals[0]
-        self.mg.configure(values=vals); self.mg.set(self.cfg["macro_target"])
-
-    # Macro menu handler (added v41).
+    # Macro menu handler: chooses the macro the builder opens and Delete removes (added v41; changed v43).
     def macro_pick(self, name):
-        self.cfg["macro_sel"] = name if name in self.cfg["macros"] else ""; self.macro_refresh()
+        if name in self.cfg["macros"]: self.cfg["macro_sel"] = name
 
-    # Run-on menu handler (added v41).
-    def macro_target_pick(self, v): self.cfg["macro_target"] = v
+    # Handler of an account's macro menu: 'None' = this account does not run anything (added v43).
+    def macro_assign(self, acct, name):
+        if name in self.cfg["macros"]: self.cfg["macro_map"][acct] = name
+        else: self.cfg["macro_map"].pop(acct, None)
 
-    # New button: empty editor; Save then asks for a name (added v41).
-    def macro_new(self):
-        self.cfg["macro_sel"] = ""; self.macro_refresh()
-
-    # Parses the editor text and saves it under the selected name (asks for one when it is new) (added v41).
-    def macro_save(self):
-        steps, err = parse_macro(self.mt.get("1.0", "end"))
-        if err: return self.note("Macro", err)
-        if not steps: return self.note("Macro", "Nothing to save - record or type some steps first.")
-        name = self.cfg["macro_sel"] or self.ask("Save macro", "Name for this macro:", default=f"Macro {len(self.cfg['macros']) + 1}")
-        if not name or not name.strip(): return
-        name = name.strip()[:40]; self.cfg["macros"][name] = steps; self.cfg["macro_sel"] = name
-        self.macro_refresh(); self.log(f"Macro '{name}' saved ({len(steps)} steps)", "ok")
-
-    # Deletes the selected macro after a confirmation (added v41).
+    # Deletes the macro chosen in the macro menu after a confirmation (added v41).
     def macro_delete(self):
         sel = self.cfg["macro_sel"]
         if not sel: return
+        if self.builder: return self.say("Close the visual builder first")
         if self.confirm("Delete macro", f"Delete the macro '{sel}'?", [("Delete", True), ("Cancel", None)]) is not True: return
-        self.cfg["macros"].pop(sel, None); self.cfg["macro_sel"] = next(iter(self.cfg["macros"]), ""); self.macro_refresh()
+        self.cfg["macros"].pop(sel, None); self.macro_refresh()
 
-    # Validates the macro hotkey entry, stores it and restarts the hotkey thread so it takes effect (added v41).
-    def apply_macro_key(self):
-        txt = self.v["macro_key"].get().strip().lower()
-        if txt and not hotkey_spec(txt): return self.note("Macro hotkey", "Not a valid hotkey. Use e.g. ctrl+alt+m or F8 (modifiers: ctrl, shift, alt, win).")
-        self.cfg["macro_key"] = txt; self.v["macro_key"].set(txt)
+    def hk_key(self):
+        """Last macro-hotkey box: opens a window with a search bar and the list of keys instead of one huge drop-down menu."""
+        k = self.confirm("Macro hotkey key", "Type to search, then pick the key.", [("Select", True), ("Cancel", None)], choices=HK_PICK)
+        if not k: return
+        self.hk_v[2].set(k); self.hk_btn.configure(text=k); self.hk_pick()
+
+    # The macro hotkey pickers changed: validates the combination, stores it as text (e.g. 'ctrl+shift+k' or 'k') and restarts the hotkey
+    # thread so it takes effect (added v43; replaces the typed hotkey entry).
+    def hk_pick(self, _=None):
+        a, b, k = (v.get() for v in self.hk_v)
+        if a == b != "_":
+            b = "_"; self.hk_v[1].set(b); self.note("Macro hotkey", "Each modifier can only be used once.")
+        self.cfg["macro_key"] = "+".join(p for p in (a, b, k) if p != "_")
         if self.cfg["hotkeys"]: self.hotkeys(False); self.hotkeys(True)
-        self.log(f"Macro hotkey: {txt or 'none'}" + ("" if self.cfg["hotkeys"] else " (turn Hotkeys on to use it)"))
+        self.log(f"Macro hotkey: {self.cfg['macro_key']}" + ("" if self.cfg["hotkeys"] else " (turn Hotkeys on to use it)"))
 
-    # Windows the macro runs on, from the 'Run on' menu (added v41).
-    def macro_targets(self):
-        alive, t = self.live(), self.cfg["macro_target"]
-        if t == "Focused account": return [self.active] if self.active in alive else []
-        if t == "All running accounts": return [h for h in self.windows.values() if h in alive]
-        h = self.windows.get(t); return [h] if h in alive else []
+    # Running accounts that have a macro: [(account, window, steps)] in viewer order (added v43; replaces macro_targets / 'Run on').
+    def macro_jobs(self):
+        alive, mp = self.live(), self.cfg["macro_map"]
+        return [(n, h, self.cfg["macros"][mp[n]]) for n, h in self.windows.items() if h in alive and mp.get(n) in self.cfg["macros"]]
 
-    # Hotkey / button: starts the selected macro, or stops it when it is running (added v41).
+    # Hotkey: stops everything when something runs, otherwise starts the macros; ignored while the builder records (added v41; changed v42, v43).
     def macro_toggle(self):
-        if self.macro_on or self.bg_job: self.macro_abort()          # (changed v42: also stops a background job)
+        if self.builder and self.builder.rec: return
+        if self.macro_on or self.bg_job: self.macro_panic()
         else: self.macro_start()
 
-    # Starts the selected macro on its target accounts, one after another, like an Anti-AFK round (added v41; changed v42: steps / hws /
-    # name can be given (the visual builder's Test uses that), on_done is called when the run ends, on_step(i) before each step in background
-    # mode, 'Background input' posts everything to the windows instead of using the real mouse; returns True when a run was started).
-    def macro_start(self, steps=None, hws=None, name=None, on_done=None, on_step=None):
-        name = name or self.cfg["macro_sel"]; steps = steps or self.cfg["macros"].get(name)
-        if self.afk_busy or self.rec: return self.say("Macro: wait until the Anti-AFK round / recorder is finished")
-        if not steps: return self.say("Macro: select or record a macro first")
-        hws = hws or self.macro_targets()
-        if not hws: return self.say(f"Macro: no running account for '{self.cfg['macro_target']}'")
-        self.collect(); loops = min(999, max(1, self.cfg["macro_loops"]))
-        if self.cfg["macro_bg"]: return self.macro_start_bg(name, steps, hws, loops, on_step, on_done)
+    # Run button / hotkey: every running account plays its own macro (account -> macro list) - one account after another with the real mouse,
+    # or all at once with Background input. jobs = [(account or None, window, steps)] plays exactly these (the builder's Test, with once=True
+    # = a single time); on_done is called when the run ends, on_step(i) before each step in background mode. Run forever repeats until End.
+    # Returns True when a run was started (added v41; changed v42: jobs / callbacks / background; changed v43: per-account macros, Run forever).
+    def macro_start(self, jobs=None, name="", on_done=None, on_step=None, once=False):
+        if self.afk_busy or self.bg_job: return self.say("Macro: a run is still going - press End to stop it")
+        jobs = jobs or self.macro_jobs()
+        if not jobs: return self.say("Macro: no running account has a macro - pick one per account first")
+        self.collect(); loops = None if self.cfg["macro_forever"] and not once else 1 if once else min(999, max(1, self.cfg["macro_loops"]))
+        what = f"Macro '{name}'" if name else "Macros"; how = "until End" if loops is None else f"{loops}x"
+        if self.cfg["macro_bg"]:
+            wake, one, steps = self.cfg["bg_wake"], len(jobs) == 1, {hw: st for _, hw, st in jobs}
+            self.log(f"{what} started in the background on {len(steps)} account(s), {how}")
+            self.bg_start(what, list(steps), lambda h, stop: bg_play(h, steps[h], stop, wake, loops, on_step if one else None), on_done)
+            return True
         if self.state() == "iconic": return self.say("Macro waiting: the manager is minimized")
         self.afk_busy = self.macro_on = True
-        self.afk_prev = (self.tv.get(), self.active)
+        self.afk_prev = (self.tv.get(), self.active, self.unfocused)
         old = wt.POINT(); user32.GetCursorPos(ctypes.byref(old)); self.afk_cursor = (old.x, old.y)
         if self.tv.get() != "Viewer": self.tv.set("Viewer")
-        seq = []
-        for hw in hws: seq += [(700, lambda h=hw: self.switch_to(h)), (400, lambda: None)] + self.macro_body(hw, steps) * loops
-        seq.append((300, self.macro_finish))
-        self.log(f"Macro '{name}' started on {len(hws)} account(s), {loops}x")
-        self.macro_cb = on_done; self.macro_seq(seq, 0); return True
+        self.log(f"{what} started on {len(jobs)} account(s), {how}")
+        self.macro_cb = on_done; self.macro_seq(self.macro_gen(jobs, loops)); return True
 
-    # Runs a (delay, action) list one entry at a time; stops as soon as macro_on is cleared (added v41).
-    def macro_seq(self, seq, i):
-        if i >= len(seq): return
-        d, fn = seq[i]
+    # Yields the (delay ms, action) list of a real-mouse run lazily: each account is switched to (unless it is already in front) and plays
+    # its macro `loops` times; with loops=None the whole round repeats, one pass per account, until the run is stopped (added v43).
+    def macro_gen(self, jobs, loops):
+        while True:
+            for _, hw, steps in jobs:
+                if hw != self.active: yield 700, lambda h=hw: self.switch_to(h); yield 400, lambda: None
+                for _ in range(loops or 1): yield from self.macro_body(hw, steps)
+            if loops: break
+        yield 300, self.macro_finish
+
+    # Runs a (delay, action) iterator one entry at a time; stops as soon as macro_on is cleared (added v41; changed v43: takes an iterator).
+    def macro_seq(self, it):
+        nxt = next(it, None)
+        if nxt is None: return
+        d, fn = nxt
         # Runs one action, then schedules the next.
         def go():
             self._m_job = None
             try: fn()
             except Exception as ex: self.log(f"Macro error: {str(ex)[:70]}", "warn")
-            if self.macro_on: self.macro_seq(seq, i + 1)
-        self._m_job = self.after(d, go)
+            if self.macro_on: self.macro_seq(it)
+        self._m_job = self.after(max(1, d), go)
 
-    # Stops a running macro right away (added v41).
-    def macro_abort(self):
-        if self.bg_job: self.bg_job["stop"].set(); return                # background job: its threads stop and bg_done reports it (added v42)
-        if self._m_job: self.after_cancel(self._m_job); self._m_job = None
-        self.macro_finish(); self.log("Macro stopped", "warn")
+    # End button / macro hotkey while something runs: stops the macro at once - the real-mouse macro, the background macro or the builder test -
+    # lets go of every held key and mouse button, restores tab, focused account and cursor, and logs it. Anti-AFK keeps running
+    # (added v43; replaces macro_abort; changed v44).
+    def macro_panic(self):
+        if not (self.macro_on or self.bg_job): return self.say("End: nothing is running")
+        if self.bg_job: self.bg_job["stop"].set()                         # workers wake up at once, release their keys / buttons; bg_done reports it
+        if self.macro_on:
+            if self._m_job: self.after_cancel(self._m_job); self._m_job = None
+            self.macro_finish(True)
+        self.log("END: macro stopped, keys and mouse buttons released", "warn")
 
-    # Releases mouse / keys, restores the previous tab, focused account and cursor (added v41).
-    def macro_finish(self):
+    # Releases mouse / keys, restores the previous tab, focused account and cursor, then calls the run's end callback (added v41; changed v42, v43).
+    def macro_finish(self, stopped=False):
         if not self.macro_on: return
         self.macro_on = False; self.m_up(); self.m_keys(None, None, False)
-        prev_tab, prev_active = self.afk_prev
+        prev_tab, prev_active, prev_unf = self.afk_prev
         if prev_active in self.live() and prev_active != self.active: self.switch_to(prev_active)
+        if prev_unf: self.unfocus(True)
         if prev_tab != "Viewer": self.after(800, lambda: self.tv.set(prev_tab))
         user32.SetCursorPos(*self.afk_cursor); self.afk_busy = False
-        self.log("Macro done", "ok")
+        if not stopped: self.log("Macro done", "ok")
         cb, self.macro_cb = self.macro_cb, None
-        if cb: cb()                                                      # (added v42)
+        if cb: cb()
 
     # Turns macro steps into (delay ms, action) pairs for one window; swipes become a series of small cursor moves (added v41).
     def macro_body(self, hw, steps):
@@ -3169,119 +3474,12 @@ class App(ctk.CTk):
     def m_vk(self, v, up):
         user32.keybd_event(v, user32.MapVirtualKeyW(v, 0), (1 if v in EXT_KEYS else 0) | (2 if up else 0), 0)
 
-    # Recorder button: shows the Viewer, then opens the see-through recording layer over the focused window (added v41).
-    def macro_record(self):
-        hw = self.active
-        if self.builder: return self.say("Recorder: close the visual builder first")
-        if self.rec or self.macro_on or self.afk_busy or hw not in self.live(): return self.say("Recorder: focus a running account in the Viewer first")
-        self.tv.set("Viewer"); self.after(400, lambda: self.rec_open(hw))
-
-    # The recording layer: a see-through window exactly over the game's client area. Click = click, press 0.5 s+ = hold,
-    # drag = swipe (right button = right click), typed keys / combos = key steps, gaps become wait steps; the toolbar has
-    # Done / Undo / Cancel (added v41).
-    def rec_open(self, hw):
-        if self.rec or not user32.IsWindow(hw): return
-        rc = wt.RECT(); user32.GetClientRect(hw, ctypes.byref(rc)); org = wt.POINT(0, 0); user32.ClientToScreen(hw, ctypes.byref(org))
-        cw, ch = max(rc.right, 50), max(rc.bottom, 50)
-        top = self.rec = tk.Toplevel(self); top.overrideredirect(True); top.attributes("-topmost", True); top.attributes("-alpha", 0.45)
-        top.geometry(f"{cw}x{ch}+{org.x}+{org.y}"); top.configure(bg="#0b1020")
-        cv = tk.Canvas(top, bg="#0b1020", highlightthickness=0, cursor="crosshair"); cv.pack(fill="both", expand=True)
-        st = {"steps": [], "undo": [], "press": None, "last": 0.0, "n": 0, "tmp": None}
-        bar = tk.Frame(top, bg="#000000"); bar.place(x=8, y=8)
-        info = tk.Label(bar, text="0 steps", width=9, bg="#000000", fg="#ffffff", font=("Segoe UI", 10)); info.pack(side="left")
-
-        # Draws a numbered circle (hold = thick ring) and returns its canvas ids.
-        def dot(x, y, n=None, ring=False):
-            ids = [cv.create_oval(x - 22, y - 22, x + 22, y + 22, fill="#3b8ee8", outline="#cfe6ff", width=5 if ring else 2)]
-            if n is not None: ids.append(cv.create_text(x, y, text=str(n), fill="#ffffff", font=("Segoe UI Semibold", 13)))
-            return ids
-
-        # Stores one recorded step (with a wait step for a pause of 0.3 s or more before it) and remembers how to undo it.
-        def push(step, t0, ids):
-            added = 1
-            if st["last"] and t0 - st["last"] >= 0.3: st["steps"].append(["wait", min(60000, round((t0 - st["last"]) * 20) * 50)]); added = 2
-            st["steps"].append(step); st["undo"].append((added, ids)); st["last"] = time.time(); info.configure(text=f"{len(st['steps'])} steps")
-
-        # Mouse press: remembers where and when.
-        def down(e): st["press"] = (e.x, e.y, time.time(), "right" if e.num == 3 else "left")
-
-        # Mouse drag: shows the swipe line while the left button is held.
-        def drag(e):
-            if not st["press"]: return
-            if st["tmp"]: cv.delete(st["tmp"])
-            st["tmp"] = cv.create_line(st["press"][0], st["press"][1], e.x, e.y, fill="#3b8ee8", width=30, capstyle="round")
-
-        # Mouse release: turns the gesture into a click, hold or swipe step.
-        def up(e):
-            p, st["press"] = st["press"], None
-            if st["tmp"]: cv.delete(st["tmp"]); st["tmp"] = None
-            if not p: return
-            x0, y0, t0, btn = p; ms = int((time.time() - t0) * 1000)
-            f = lambda v, m: min(1.0, max(0.0, round(v / m, 4)))
-            st["n"] += 1; n = st["n"]
-            if btn == "left" and (e.x - x0) ** 2 + (e.y - y0) ** 2 > 196:
-                ids = [cv.create_line(x0, y0, e.x, e.y, fill="#3b8ee8", width=30, capstyle="round")] + dot(x0, y0, n) + dot(e.x, e.y)
-                push(["swipe", f(x0, cw), f(y0, ch), f(e.x, cw), f(e.y, ch), max(100, min(3000, round(ms / 50) * 50))], t0, ids)
-            elif btn == "left" and ms >= 500: push(["hold", f(x0, cw), f(y0, ch), round(ms / 50) * 50, "left"], t0, dot(x0, y0, n, True))
-            else: push(["click", f(x0, cw), f(y0, ch), btn], t0, dot(x0, y0, n))
-
-        # Key press: records a key or combo (ctrl / shift / alt + key).
-        def keys(e):
-            ks = e.keysym.lower()
-            if ks.endswith(("_l", "_r", "_lock")): return
-            name = {"return": "enter", "escape": "esc", "prior": "pageup", "next": "pagedown"}.get(ks, ks)
-            if key_vk(name) is None: return
-            mods = [m for m, bit in (("ctrl", 0x4), ("shift", 0x1), ("alt", 0x20000)) if e.state & bit]
-            push(["key", "+".join(mods + [name])], time.time(), [])
-            info.configure(text="key " + "+".join(mods + [name])[:14])
-
-        # Removes the last recorded action (and its wait) from the list and the picture.
-        def undo():
-            if not st["undo"]: return
-            k, ids = st["undo"].pop(); del st["steps"][-k:]; st["last"] = 0.0
-            for i in ids: cv.delete(i)
-            info.configure(text=f"{len(st['steps'])} steps")
-
-        # Closes the layer; Done keeps the steps and asks for a name.
-        def close(save):
-            self.rec = None; steps = st["steps"]; top.destroy()
-            if save and steps: self.after(50, lambda: self.rec_save(steps))
-
-        for t, cmd in (("Done", lambda: close(True)), ("Undo", undo), ("Cancel", lambda: close(False))):
-            b = tk.Label(bar, text=t, bg="#1e2024", fg="#ececee", padx=10, pady=5, cursor="hand2", font=("Segoe UI Semibold", 10))
-            b.pack(side="left", padx=(6, 0)); b.bind("<Button-1>", lambda e, c=cmd: c())
-        for ev, fn in (("<ButtonPress-1>", down), ("<ButtonPress-3>", down), ("<B1-Motion>", drag), ("<ButtonRelease-1>", up), ("<ButtonRelease-3>", up)):
-            cv.bind(ev, fn)
-        top.bind("<KeyPress>", keys); top.after(100, top.focus_force); top.after(120, cv.focus_set)
-
-    # Saves a recorded step list under a name asked in-app and opens it in the Macros tab (added v41).
-    def rec_save(self, steps):
-        name = self.ask("Save macro", f"Name for the recorded macro ({len(steps)} steps):", default=f"Macro {len(self.cfg['macros']) + 1}")
-        if not name or not name.strip(): return
-        name = name.strip()[:40]; self.cfg["macros"][name] = steps[:500]; self.cfg["macro_sel"] = name
-        self.macro_refresh(); self.tv.set("Macros"); self.log(f"Macro '{name}' recorded ({len(steps)} steps)", "ok")
-
     # ---------- background input and visual builder (added v42) ----------
-    # Anti-AFK round without moving the cursor or taking focus: every selected window gets a posted click in its corner, a pause and a second
-    # click, all windows at once; the focused window is skipped while you are using it, like in the normal round (added v42).
-    def afk_bg_round(self, force=False):
-        if self.bg_job: return self.say("Anti-AFK: a background job is still running") if force else None
-        alive, skip = self.live(), set(self.cfg["afk_skip"])
-        wins = [h for n, h in self.windows.items() if h in alive and n not in skip
-                and not (h == self.active and not force and user_idle_seconds() < 60)]
-        if not wins: return
-        off, gap, wake = max(1, self.cfg["afk_off"]), max(300, self.cfg["afk_gap"]), self.cfg["bg_wake"]
-        # Worker thread body for one window: click near the bottom-right corner, pause, click again (no Tk, no self.windows).
-        def work(hw, stop):
-            w, h = client_size(hw); fx, fy = max(0.0, (w - off) / max(w, 1)), max(0.0, (h - off) / max(h, 1))
-            bg_play(hw, [["click", fx, fy, "left"], ["wait", gap], ["click", fx, fy, "left"]], stop, wake)
-        self.log(f"Anti-AFK round started in the background ({len(wins)} instances)")
-        self.bg_start("Anti-AFK round", wins, work)
-
     # Starts one background job: a coordinator thread runs worker(hw, stop) in one thread per window, waits for all of them and hands the
-    # result to the main thread (bg_done). self.bg_job["stop"] (an Event) stops everything (added v42).
-    def bg_start(self, label, hws, worker, on_done=None):
-        stop = threading.Event(); self.bg_job = {"stop": stop, "label": label, "cb": on_done}
+    # result to the main thread (bg_done). The job is stored in self.<slot> (bg_job = macro / test, afk_job = Anti-AFK); its ["stop"]
+    # (an Event) stops it (added v42; changed v44: slot, so Anti-AFK and a macro can run together).
+    def bg_start(self, label, hws, worker, on_done=None, slot="bg_job"):
+        stop = threading.Event(); setattr(self, slot, {"stop": stop, "label": label, "cb": on_done})
         # Coordinator thread body (see bg_start).
         def run():
             # One worker thread: errors go to the log, never to a Tk widget.
@@ -3291,29 +3489,21 @@ class App(ctk.CTk):
             ts = [threading.Thread(target=one, args=(h,), daemon=True) for h in hws]
             for t in ts: t.start()
             for t in ts: t.join()
-            self.after(0, lambda: self.bg_done(stop.is_set()))
+            self.after(0, lambda: self.bg_done(slot, stop.is_set()))
         threading.Thread(target=run, daemon=True).start()
 
-    # Main thread: a background job has ended; logs it, frees the slot and calls the job's callback (added v42).
-    def bg_done(self, stopped):
-        job, self.bg_job = self.bg_job, None
+    # Main thread: a background job has ended; logs it, frees the slot and calls the job's callback (added v42; changed v44: slot).
+    def bg_done(self, slot, stopped):
+        job = getattr(self, slot); setattr(self, slot, None)
         if not job: return
         self.log(f"{job['label']} {'stopped' if stopped else 'done'}", "warn" if stopped else "ok")
         if job["cb"]: job["cb"]()
-
-    # Runs a macro with posted messages on all target windows at once; True when started (added v42).
-    def macro_start_bg(self, name, steps, hws, loops, on_step=None, on_done=None):
-        if self.bg_job: self.say("Macro: a background job is still running - press the macro hotkey to stop it"); return False
-        wake, one = self.cfg["bg_wake"], len(hws) == 1
-        self.log(f"Macro '{name}' started in the background on {len(hws)} account(s), {loops}x")
-        self.bg_start(f"Macro '{name}'", hws, lambda h, stop: bg_play(h, steps, stop, wake, loops, on_step if one else None), on_done)
-        return True
 
     # 'Visual builder' button: shows the Viewer, then opens the builder over the focused window (added v42).
     def builder_open(self):
         if self.builder: self.tv.set("Viewer"); return self.builder.front()
         if self.bld_wait: return
-        if self.rec or self.macro_on or self.afk_busy or self.bg_job: return self.say("Builder: wait until the recorder / macro / Anti-AFK round is finished")
+        if self.macro_on or self.afk_busy or self.bg_job: return self.say("Builder: wait until the macro / Anti-AFK round is finished (End stops it)")
         if self.active not in self.live(): return self.say("Builder: focus a running account in the Viewer first")
         self.bld_wait = True; self.tv.set("Viewer")
         # Runs 0.4 s after the tab switch so the focused window is in place; opens the builder with the selected macro.
@@ -3335,16 +3525,76 @@ class App(ctk.CTk):
         self.cfg["dc_token"] = enc(tok.strip()) if tok.strip() else ""
         self.dc_lab.configure(text="Token: set" if self.cfg["dc_token"] else "Token: not set")
 
-    # Send test button (added v41).
-    def dc_test(self):
-        self.collect(); threading.Thread(target=self.discord_send, args=("[Better RAM] test message - alerts work", True), daemon=True).start()
+    # The alert text from the 'Alert text' setting: {msg} = the event, {account} = the account it is about (or empty), {time} (added v43).
+    def dc_text(self, msg):
+        acct = next((a["name"] for a in self.cfg["accounts"] if msg.startswith(a["name"] + ":")), "")
+        return fill(self.cfg["dc_fmt"] or DEFAULTS["dc_fmt"], {"msg": msg, "account": acct, "time": time.strftime("%H:%M:%S")})
 
-    # Queues one alert from a short background thread; the same text is skipped for 60 s (added v41).
+    # Send test button (added v41; changed v43: uses the alert text setting).
+    def dc_test(self):
+        self.collect(); threading.Thread(target=self.discord_send, args=(self.dc_text("test message - alerts work"), True), daemon=True).start()
+
+    # Queues one alert from a short background thread; the same text is skipped for 60 s (added v41; changed v43: alert text setting).
     def notify(self, msg):
         now = time.time()
         if now - self.dc_seen.get(msg, 0) < 60: return
         self.dc_seen[msg] = now
-        threading.Thread(target=self.discord_send, args=(f"[Better RAM] {msg}",), daemon=True).start()
+        threading.Thread(target=self.discord_send, args=(self.dc_text(msg),), daemon=True).start()
+
+    # Apply commands button: reads the command box (one 'name = reply' per line) into the config (added v43).
+    def dc_cmds_apply(self):
+        cmds, p = [], self.cfg["dc_prefix"] or "!"
+        for no, raw in enumerate(self.dc_box.get("1.0", "end").splitlines(), 1):
+            if not raw.strip(): continue
+            name, _, reply = raw.partition("="); name, reply = name.strip().lstrip(p).lower(), reply.strip()
+            if not re.fullmatch(r"[a-z0-9_]{1,32}", name) or not reply or len(reply) > 1500 or any(c[0] == name for c in cmds):
+                return self.note("Discord commands", f"Line {no}: use  name = reply  (name: letters, digits, _; every name once; reply not empty).")
+            cmds.append([name, reply])
+        if len(cmds) > 25: return self.note("Discord commands", "At most 25 commands.")
+        self.cfg["dc_cmds"] = cmds; self.log(f"Discord commands saved ({len(cmds)})", "ok")
+
+    # Values for the {placeholders} of command replies (main thread only) (added v43).
+    def dc_vals(self):
+        run, frozen, disc, crashed = self.counts; alive, p = self.live(), self.cfg["dc_prefix"] or "!"
+        return {"running": run, "total": len(self.cfg["accounts"]), "frozen": frozen, "disc": disc, "crashed": crashed, "time": time.strftime("%H:%M:%S"),
+                "accounts": ", ".join(n for n, h in self.windows.items() if h in alive) or "none", "version": VERSION,
+                "commands": ", ".join(p + n for n, _ in self.cfg["dc_cmds"])}
+
+    # Every 6 s while 'Answer commands' is on and the bot is set up: starts one short thread that reads the channel (added v43).
+    def dc_poll(self):
+        try:
+            if self.cfg["dc_cmd_on"] and self.cfg["dc_token"] and self.cfg["dc_chan"].strip().isdigit() and not self.dc_busy:
+                self.dc_busy = True; threading.Thread(target=self.dc_fetch, daemon=True).start()
+        finally: self.after(6000, self.dc_poll)
+
+    # Thread: reads the channel's newest messages (Discord REST, only ones newer than the last seen; the first read only remembers the newest
+    # one, so nothing old is answered) and hands the command words to the main thread. Needs 'Message Content Intent' on the bot (added v43).
+    def dc_fetch(self):
+        try:
+            hdr, url = {"Authorization": f"Bot {dec(self.cfg['dc_token'])}"}, f"https://discord.com/api/v10/channels/{self.cfg['dc_chan'].strip()}/messages"
+            first = self.dc_last is None
+            r = requests.get(url, headers=hdr, params={"limit": 1} if first else {"after": self.dc_last, "limit": 20}, timeout=10); r.raise_for_status()
+            msgs = sorted(r.json(), key=lambda m: int(m["id"]))
+            if first: self.dc_last = msgs[-1]["id"] if msgs else "0"
+            elif msgs:
+                self.dc_last = msgs[-1]["id"]; p, words, empty = (self.cfg["dc_prefix"] or "!").lower(), [], False
+                for m in msgs:
+                    c = m["content"].strip()
+                    if m["author"].get("bot"): continue
+                    if not c: empty = True
+                    elif c.lower().startswith(p) and c[len(p):].split(): words.append(c[len(p):].split()[0].lower())
+                if empty and not words and not self.dc_warned: self.dc_warned = True; self.log("Discord: messages arrive empty - switch on 'Message Content Intent' for the bot", "warn")
+                if words: self.after(0, lambda: self.dc_answer(words))
+            self.dc_err = ""
+        except Exception as ex:
+            if str(ex)[:80] != self.dc_err: self.dc_err = str(ex)[:80]; self.log(f"Discord commands: {self.dc_err}", "warn")
+        finally: self.after(0, lambda: setattr(self, "dc_busy", False))
+
+    # Main thread: answers the command words with their replies (at most 5 per read), sent one after another from a thread (added v43).
+    def dc_answer(self, words):
+        cmds, vals = dict(self.cfg["dc_cmds"]), self.dc_vals()
+        texts = [fill(cmds[w], vals) for w in words[:5] if w in cmds]
+        if texts: threading.Thread(target=lambda: [self.discord_send(t) for t in texts], daemon=True).start()
 
     # Posts a message to the configured channel with the bot token (Discord REST, one retry on rate limit); runs in a thread.
     # test=True reports the result in an in-app note, otherwise failures go to the log as warnings (added v41).
@@ -3433,7 +3683,7 @@ class App(ctk.CTk):
             if ans:
                 for hw in list(self.windows.values()): kill_pid(pid_of(hw))
         self.save(); self.log("Better RAM closed")
-        if self.bg_job: self.bg_job["stop"].set(); time.sleep(0.2)       # lets running workers release held keys / buttons (added v42)
+        if self.macro_on or self.bg_job: self.macro_panic(); time.sleep(0.2)       # releases held keys / buttons before closing (added v42; changed v43)
         self.hotkeys(False); self.unembed_all(); self.destroy()
 
 if __name__ == "__main__":
